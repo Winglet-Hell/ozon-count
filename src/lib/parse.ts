@@ -22,6 +22,7 @@ export interface AnalysisResult {
     returnsCost: number;
     additionalServicesCost: number;
     promotionCost: number;
+    totalCogs: number;
 }
 
 export const parseCurrency = (value: string): number => {
@@ -90,6 +91,7 @@ export const parseReport = (file: File): Promise<AnalysisResult> => {
                     let returnsCost = 0;
                     let additionalServicesCost = 0;
                     let promotionCost = 0;
+                    let totalCogs = 0;
 
                     results.data.forEach((row) => {
                         // Safe parsing helper - handles undefined/null gracefully
@@ -100,7 +102,8 @@ export const parseReport = (file: File): Promise<AnalysisResult> => {
                         partnerPrograms += getVal("Программы партнёров");
                         marketplaceCommission += getVal("Вознаграждение Ozon");
                         orderedItems += getVal("Заказано товаров, шт");
-                        deliveredItems += getVal("Доставлено товаров, шт");
+                        const delivered = getVal("Доставлено товаров, шт");
+                        deliveredItems += delivered;
                         returnedItems += getVal("Возвращено товаров, шт");
 
                         // Logistics calculation
@@ -125,6 +128,10 @@ export const parseReport = (file: File): Promise<AnalysisResult> => {
                         promotionCost += getVal("Оплата за заказ");
                         promotionCost += getVal("Звёздные товары");
                         promotionCost += getVal("Платный бренд");
+
+                        // COGS calculation
+                        const unitCost = getVal("Себестоимость");
+                        totalCogs -= unitCost * delivered;
                     });
 
                     resolve({
@@ -139,7 +146,8 @@ export const parseReport = (file: File): Promise<AnalysisResult> => {
                         acquiringCost,
                         returnsCost,
                         additionalServicesCost,
-                        promotionCost
+                        promotionCost,
+                        totalCogs
                     });
                 },
                 error: (error: Error) => {

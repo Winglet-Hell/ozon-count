@@ -2,12 +2,18 @@ import { useState } from "react";
 import { ArticleRow } from "@/lib/parse";
 import { ArrowUpDown, ChevronDown, ChevronUp } from "lucide-react";
 import { formatCompactCurrency, formatCompactNumber } from "@/lib/utils";
+import { clsx, type ClassValue } from "clsx";
+import { twMerge } from "tailwind-merge";
+
+function cn(...inputs: ClassValue[]) {
+    return twMerge(clsx(inputs));
+}
 
 interface ArticlesTableProps {
     articles: ArticleRow[];
 }
 
-type SortField = keyof ArticleRow | "totalCosts" | "profit" | "margin" | "crossDocking" | "subscription" | "incomeTax" | "finalPromotionCost" | "totalCostsWithTax" | "totalSalesRevenue" | "avgPrice";
+type SortField = keyof ArticleRow | "totalCosts" | "profit" | "margin" | "crossDocking" | "incomeTax" | "finalPromotionCost" | "totalCostsWithTax" | "totalSalesRevenue" | "avgPrice";
 type SortDirection = "asc" | "desc";
 
 export function ArticlesTable({ articles }: ArticlesTableProps) {
@@ -38,11 +44,15 @@ export function ArticlesTable({ articles }: ArticlesTableProps) {
         const subscription = -(SUBSCRIPTION_COST * revenueShare);
 
         // 3. Promotion (Ads) - Either direct or distributed PROPORTIONALLY by Revenue
+        // NOW INCLUDES SUBSCRIPTION
         let finalPromotionCost = article.promotionCost;
         if (distributeAds) {
             const revenueShare = totalRevenue > 0 ? totalSalesRevenue / totalRevenue : 0;
             finalPromotionCost = -(Math.abs(totalPromotionCost) * revenueShare);
         }
+
+        // Add subscription to final promotion cost
+        finalPromotionCost += subscription;
 
         // 4. Total Costs (Direct + Distributed)
         const totalCosts =
@@ -53,8 +63,7 @@ export function ArticlesTable({ articles }: ArticlesTableProps) {
             article.additionalServicesCost +
             article.totalCogs +
             finalPromotionCost +
-            crossDocking +
-            subscription;
+            crossDocking;
 
         // 5. Profit (Pre-tax)
         const profitPreTax = totalSalesRevenue + totalCosts;
@@ -131,35 +140,89 @@ export function ArticlesTable({ articles }: ArticlesTableProps) {
         </div>
     );
 
+
+    // Calculate totals for summary metrics
+    // We need to calculate Total Profit using the same logic as the Dashboard:
+    // 1. Sum up all Pre-Tax Costs
+    // 2. Sum up Total Revenue
+    // 3. Calculate Global Tax on the (Revenue + Costs)
+    // 4. Net Profit = (Revenue + Costs) - Tax
+
+    const totalPreTaxCosts = enrichedArticles.reduce((sum, a) =>
+        sum +
+        a.marketplaceCommission +
+        a.logisticsCost +
+        a.acquiringCost +
+        a.returnsCost +
+        a.additionalServicesCost +
+        a.totalCogs +
+        a.finalPromotionCost +
+        a.crossDocking
+        , 0);
+
+    const totalPreTaxProfit = totalRevenue + totalPreTaxCosts;
+    const globalIncomeTax = totalPreTaxProfit > 0 ? -(totalPreTaxProfit * INCOME_TAX_RATE) : 0;
+    const totalProfit = totalPreTaxProfit + globalIncomeTax;
+
+    const totalMargin = totalRevenue > 0 ? (totalProfit / totalRevenue) * 100 : 0;
+
     return (
         <div className="space-y-4">
-            <div className="flex items-center justify-end space-x-4 bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
-                <div className="flex items-center space-x-2">
-                    <label htmlFor="distribute-ads" className="text-sm font-medium text-slate-700 cursor-pointer select-none">
-                        Spread Ads Proportionally (by Revenue)
-                    </label>
-                    <button
-                        id="distribute-ads"
-                        onClick={() => setDistributeAds(!distributeAds)}
-                        className={cn(
-                            "relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2",
-                            distributeAds ? "bg-blue-600" : "bg-slate-200"
-                        )}
-                    >
-                        <span
+            <div className="flex items-center justify-between space-x-4 bg-white p-4 rounded-xl border border-slate-200 shadow-sm">
+                <div className="flex items-center gap-6 text-sm">
+                    <div className="flex flex-col">
+                        <span className="text-slate-500 text-xs uppercase tracking-wider font-semibold">SKUs</span>
+                        <span className="font-bold text-slate-800 text-lg leading-tight">{formatNumber(enrichedArticles.length)}</span>
+                    </div>
+                    <div className="w-px h-8 bg-slate-200" />
+                    <div className="flex flex-col">
+                        <span className="text-slate-500 text-xs uppercase tracking-wider font-semibold">Total Revenue</span>
+                        <span className="font-bold text-slate-800 text-lg leading-tight">{formatCurrency(totalRevenue)}</span>
+                    </div>
+                    <div className="w-px h-8 bg-slate-200" />
+                    <div className="flex flex-col">
+                        <span className="text-slate-500 text-xs uppercase tracking-wider font-semibold">Total Profit</span>
+                        <span className={cn("font-bold text-lg leading-tight", totalProfit > 0 ? "text-emerald-600" : "text-red-600")}>
+                            {formatCurrency(totalProfit)}
+                        </span>
+                    </div>
+                    <div className="w-px h-8 bg-slate-200" />
+                    <div className="flex flex-col">
+                        <span className="text-slate-500 text-xs uppercase tracking-wider font-semibold">Avg. Margin</span>
+                        <span className={cn("font-bold text-lg leading-tight", totalMargin > 0 ? "text-emerald-600" : "text-red-600")}>
+                            {totalMargin.toFixed(1)}%
+                        </span>
+                    </div>
+                </div>
+
+                <div className="flex items-center space-x-2 border-l border-slate-200 pl-4">
+                    <div className="flex items-center space-x-2">
+                        <label htmlFor="distribute-ads" className="text-sm font-medium text-slate-700 cursor-pointer select-none">
+                            Spread Ads Proportionally (by Revenue)
+                        </label>
+                        <button
+                            id="distribute-ads"
+                            onClick={() => setDistributeAds(!distributeAds)}
                             className={cn(
-                                "inline-block h-4 w-4 transform rounded-full bg-white transition-transform",
-                                distributeAds ? "translate-x-6" : "translate-x-1"
+                                "relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2",
+                                distributeAds ? "bg-blue-600" : "bg-slate-200"
                             )}
-                        />
-                    </button>
+                        >
+                            <span
+                                className={cn(
+                                    "inline-block h-4 w-4 transform rounded-full bg-white transition-transform",
+                                    distributeAds ? "translate-x-6" : "translate-x-1"
+                                )}
+                            />
+                        </button>
+                    </div>
                 </div>
             </div>
 
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
                 <div className="overflow-x-auto">
-                    <table className="w-full text-sm text-left whitespace-nowrap">
-                        <thead className="bg-slate-50 text-slate-700 font-medium border-b border-slate-200">
+                    <table className="w-full text-sm text-left whitespace-nowrap border-separate border-spacing-0">
+                        <thead className="bg-slate-50 text-slate-700 font-medium [&_th]:border-b [&_th]:border-slate-200">
                             <tr>
                                 <th className="p-4 cursor-pointer hover:bg-slate-100 transition-colors sticky left-0 bg-slate-50 z-20 border-r border-slate-200 min-w-[400px] w-[400px] max-w-[400px]" onClick={() => handleSort("sku")}>
                                     <div className="flex items-center gap-2">
@@ -236,11 +299,7 @@ export function ArticlesTable({ articles }: ArticlesTableProps) {
                                         Cross Docking <SortIcon field="crossDocking" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("subscription")}>
-                                    <div className="flex items-center justify-end gap-2">
-                                        Subscr. <SortIcon field="subscription" />
-                                    </div>
-                                </th>
+
                                 <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("finalPromotionCost")}>
                                     <div className="flex items-center justify-end gap-2">
                                         Ads <SortIcon field="finalPromotionCost" />
@@ -268,7 +327,7 @@ export function ArticlesTable({ articles }: ArticlesTableProps) {
                                 </th>
                             </tr>
                         </thead>
-                        <tbody className="divide-y divide-slate-100">
+                        <tbody className="[&_td]:border-b [&_td]:border-slate-100">
                             {sortedArticles.map((article) => (
                                 <tr key={article.sku} className="hover:bg-slate-50 transition-colors">
                                     <td className="p-4 font-mono text-xs sticky left-0 bg-white z-10 border-r border-slate-200 min-w-[400px] w-[400px] max-w-[400px]" title={article.name}>
@@ -297,7 +356,7 @@ export function ArticlesTable({ articles }: ArticlesTableProps) {
                                     <td className="p-4 text-right text-slate-500">{renderWithPercent(article.returnsCost, article.totalSalesRevenue)}</td>
                                     <td className="p-4 text-right text-slate-500">{renderWithPercent(article.additionalServicesCost, article.totalSalesRevenue)}</td>
                                     <td className="p-4 text-right text-red-600/70">{renderWithPercent(article.crossDocking, article.totalSalesRevenue)}</td>
-                                    <td className="p-4 text-right text-red-600/70">{renderWithPercent(article.subscription, article.totalSalesRevenue)}</td>
+
                                     <td className="p-4 text-right text-red-600/70">{renderWithPercent(article.finalPromotionCost, article.totalSalesRevenue)}</td>
                                     <td className="p-4 text-right text-red-600/70">{renderWithPercent(article.incomeTax, article.totalSalesRevenue)}</td>
                                     <td className="p-4 text-right text-red-600 font-medium">{renderWithPercent(article.totalCostsWithTax, article.totalSalesRevenue)}</td>
@@ -324,11 +383,4 @@ export function ArticlesTable({ articles }: ArticlesTableProps) {
     );
 }
 
-// Minimal classname helper to avoid importing huge utils if not needed, 
-// though we can import standard cn if available.
-import { clsx, type ClassValue } from "clsx";
-import { twMerge } from "tailwind-merge";
 
-function cn(...inputs: ClassValue[]) {
-    return twMerge(clsx(inputs));
-}

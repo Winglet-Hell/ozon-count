@@ -202,9 +202,6 @@ export const parseReport = (file: File): Promise<AnalysisResult> => {
                     // Finalize article calculations
                     const articles = Array.from(articlesMap.values());
 
-                    // Add fixed subscription cost
-                    promotionCost -= 24990;
-
                     resolve({
                         revenue,
                         discountPoints,

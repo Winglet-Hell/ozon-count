@@ -9,6 +9,24 @@ export interface ReportRow {
     [key: string]: string;
 }
 
+export interface ArticleRow {
+    sku: string;
+    name: string;
+    revenue: number;
+    discountPoints: number;
+    partnerPrograms: number;
+    marketplaceCommission: number;
+    orderedItems: number;
+    deliveredItems: number;
+    returnedItems: number;
+    logisticsCost: number;
+    acquiringCost: number;
+    returnsCost: number;
+    additionalServicesCost: number;
+    promotionCost: number;
+    totalCogs: number;
+}
+
 export interface AnalysisResult {
     revenue: number;
     discountPoints: number;
@@ -23,6 +41,7 @@ export interface AnalysisResult {
     additionalServicesCost: number;
     promotionCost: number;
     totalCogs: number;
+    articles: ArticleRow[];
 }
 
 export const parseCurrency = (value: string): number => {
@@ -67,17 +86,9 @@ export const parseReport = (file: File): Promise<AnalysisResult> => {
             // Extract content starting from header line
             const csvContent = lines.slice(headerLineIndex).join("\n");
 
-            // Use Papa Parse directly on the string content
-            // We need to allow for proper parsing of quoted fields which Papa Parse handles well
-            // However, we should ensure we're passing the string correctly
-
-            // Re-import Papa to ensure types are correct in this scope if needed, 
-            // but relying on the outer import is standard.
-
             Papa.parse<ReportRow>(csvContent, {
                 header: true,
                 skipEmptyLines: true,
-                // Add quoting support if needed, but defaults usually work for standard CSVs
                 complete: (results) => {
                     let revenue = 0;
                     let discountPoints = 0;
@@ -93,10 +104,13 @@ export const parseReport = (file: File): Promise<AnalysisResult> => {
                     let promotionCost = 0;
                     let totalCogs = 0;
 
+                    const articlesMap = new Map<string, ArticleRow>();
+
                     results.data.forEach((row) => {
                         // Safe parsing helper - handles undefined/null gracefully
                         const getVal = (key: string) => row[key] ? parseCurrency(row[key]) : 0;
 
+                        // Global accumulations
                         revenue += getVal("Выручка");
                         discountPoints += getVal("Баллы за скидки");
                         partnerPrograms += getVal("Программы партнёров");
@@ -107,32 +121,89 @@ export const parseReport = (file: File): Promise<AnalysisResult> => {
                         returnedItems += getVal("Возвращено товаров, шт");
 
                         // Logistics calculation
-                        logisticsCost += getVal("Обработка отправления");
-                        logisticsCost += getVal("Логистика");
-                        logisticsCost += getVal("Доставка до места выдачи");
-                        logisticsCost += getVal("Стоимость размещения");
+                        let rowLogistics = 0;
+                        rowLogistics += getVal("Обработка отправления");
+                        rowLogistics += getVal("Логистика");
+                        rowLogistics += getVal("Доставка до места выдачи");
+                        rowLogistics += getVal("Стоимость размещения");
+                        logisticsCost += rowLogistics;
 
                         // Acquiring calculation
-                        acquiringCost += getVal("Эквайринг");
+                        const rowAcquiring = getVal("Эквайринг");
+                        acquiringCost += rowAcquiring;
 
                         // Returns Cost calculation
-                        returnsCost += getVal("Обработка возврата");
-                        returnsCost += getVal("Обратная логистика");
+                        let rowReturns = 0;
+                        rowReturns += getVal("Обработка возврата");
+                        rowReturns += getVal("Обратная логистика");
+                        returnsCost += rowReturns;
 
                         // Additional Services calculation
-                        additionalServicesCost += getVal("Утилизация");
-                        additionalServicesCost += getVal("Обработка ошибок продавца");
+                        let rowAdditional = 0;
+                        rowAdditional += getVal("Утилизация");
+                        rowAdditional += getVal("Обработка ошибок продавца");
+                        additionalServicesCost += rowAdditional;
 
                         // Promotion Cost calculation
-                        promotionCost += getVal("Оплата за клик");
-                        promotionCost += getVal("Оплата за заказ");
-                        promotionCost += getVal("Звёздные товары");
-                        promotionCost += getVal("Платный бренд");
+                        let rowPromotion = 0;
+                        rowPromotion += getVal("Оплата за клик");
+                        rowPromotion += getVal("Оплата за заказ");
+                        rowPromotion += getVal("Звёздные товары");
+                        rowPromotion += getVal("Платный бренд");
+                        promotionCost += rowPromotion;
 
                         // COGS calculation
                         const unitCost = getVal("Себестоимость");
-                        totalCogs -= unitCost * delivered;
+                        const returned = getVal("Возвращено товаров, шт");
+                        const rowCogs = -(unitCost * (delivered - returned));
+                        totalCogs += rowCogs;
+
+
+                        // Article aggregation
+                        const sku = row["Артикул"] || "Unknown";
+                        const name = row["Наименование товара"] || "Unknown";
+
+                        if (!articlesMap.has(sku)) {
+                            articlesMap.set(sku, {
+                                sku,
+                                name,
+                                revenue: 0,
+                                discountPoints: 0,
+                                partnerPrograms: 0,
+                                marketplaceCommission: 0,
+                                orderedItems: 0,
+                                deliveredItems: 0,
+                                returnedItems: 0,
+                                logisticsCost: 0,
+                                acquiringCost: 0,
+                                returnsCost: 0,
+                                additionalServicesCost: 0,
+                                promotionCost: 0,
+                                totalCogs: 0
+                            });
+                        }
+
+                        const article = articlesMap.get(sku)!;
+                        article.revenue += getVal("Выручка");
+                        article.discountPoints += getVal("Баллы за скидки");
+                        article.partnerPrograms += getVal("Программы партнёров");
+                        article.marketplaceCommission += getVal("Вознаграждение Ozon");
+                        article.orderedItems += getVal("Заказано товаров, шт");
+                        article.deliveredItems += delivered;
+                        article.returnedItems += getVal("Возвращено товаров, шт");
+                        article.logisticsCost += rowLogistics;
+                        article.acquiringCost += rowAcquiring;
+                        article.returnsCost += rowReturns;
+                        article.additionalServicesCost += rowAdditional;
+                        article.promotionCost += rowPromotion;
+                        article.totalCogs += rowCogs;
                     });
+
+                    // Finalize article calculations
+                    const articles = Array.from(articlesMap.values());
+
+                    // Add fixed subscription cost
+                    promotionCost -= 24990;
 
                     resolve({
                         revenue,
@@ -147,7 +218,8 @@ export const parseReport = (file: File): Promise<AnalysisResult> => {
                         returnsCost,
                         additionalServicesCost,
                         promotionCost,
-                        totalCogs
+                        totalCogs,
+                        articles
                     });
                 },
                 error: (error: Error) => {

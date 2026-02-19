@@ -134,7 +134,7 @@ export function ArticlesTable({ articles }: ArticlesTableProps) {
     const renderWithPercent = (val: number, total: number) => (
         <div className="flex flex-col items-end">
             <span>{formatCurrency(val)}</span>
-            <span className="text-[10px] opacity-70">
+            <span className="text-[10px] opacity-0 group-hover:opacity-70 transition-opacity duration-200">
                 {total > 0 ? ((Math.abs(val) / total) * 100).toFixed(1) : "0.0"}%
             </span>
         </div>
@@ -220,150 +220,162 @@ export function ArticlesTable({ articles }: ArticlesTableProps) {
             </div>
 
             <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                <div className="overflow-x-auto">
+                <div className="overflow-x-auto max-h-[calc(100vh-240px)] overflow-y-auto">
                     <table className="w-full text-sm text-left whitespace-nowrap border-separate border-spacing-0">
                         <thead className="bg-slate-50 text-slate-700 font-medium [&_th]:border-b [&_th]:border-slate-200">
+                            {/* Super Headers */}
+                            <tr className="text-xs uppercase tracking-wider font-bold">
+                                <th colSpan={3} className="p-2 border-r border-slate-200 bg-slate-50 text-center text-slate-400 sticky left-0 top-0 z-50 h-[40px]">
+                                    Statistics
+                                </th>
+
+                                <th colSpan={4} className="p-2 border-r border-emerald-200 bg-emerald-100 text-center text-emerald-700 sticky top-0 z-40 h-[40px]">
+                                    Income
+                                </th>
+                                <th colSpan={10} className="p-2 border-r border-rose-200 bg-rose-100 text-center text-rose-700 sticky top-0 z-40 h-[40px]">
+                                    Costs
+                                </th>
+                                <th colSpan={2} className="p-2 bg-slate-50 text-center text-slate-600 sticky top-0 z-40 h-[40px]">
+                                    Result
+                                </th>
+                            </tr>
                             <tr>
-                                <th className="p-4 cursor-pointer hover:bg-slate-100 transition-colors sticky left-0 bg-slate-50 z-20 border-r border-slate-200 min-w-[400px] w-[400px] max-w-[400px]" onClick={() => handleSort("sku")}>
+                                <th className="p-4 cursor-pointer hover:bg-slate-100 transition-colors sticky left-0 bg-slate-50 z-50 border-r border-slate-200 min-w-[400px] w-[400px] max-w-[400px] top-[40px]" onClick={() => handleSort("sku")}>
                                     <div className="flex items-center gap-2">
                                         SKU <SortIcon field="sku" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors sticky left-[400px] bg-slate-50 z-20 border-r border-slate-200 shadow-[4px_0_4px_-2px_rgba(0,0,0,0.05)] min-w-[120px]" onClick={() => handleSort("deliveredItems")}>
+                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors sticky left-[400px] bg-slate-50 z-50 border-r border-slate-200 shadow-[4px_0_4px_-2px_rgba(0,0,0,0.05)] w-[120px] min-w-[120px] max-w-[120px] top-[40px]" onClick={() => handleSort("deliveredItems")}>
                                     <div className="flex items-center justify-end gap-2">
                                         Delivered <SortIcon field="deliveredItems" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("orderedItems")}>
-                                    <div className="flex items-center justify-end gap-2">
-                                        Ordered <SortIcon field="orderedItems" />
-                                    </div>
-                                </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("revenue")}>
-                                    <div className="flex items-center justify-end gap-2">
-                                        Revenue <SortIcon field="revenue" />
-                                    </div>
-                                </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("discountPoints")}>
-                                    <div className="flex items-center justify-end gap-2">
-                                        Points <SortIcon field="discountPoints" />
-                                    </div>
-                                </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("partnerPrograms")}>
-                                    <div className="flex items-center justify-end gap-2">
-                                        Partners <SortIcon field="partnerPrograms" />
-                                    </div>
-                                </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("totalSalesRevenue")}>
-                                    <div className="flex items-center justify-end gap-2">
-                                        Total Sales <SortIcon field="totalSalesRevenue" />
-                                    </div>
-                                </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("avgPrice")}>
+                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors sticky left-[520px] bg-slate-50 z-50 border-r border-slate-200 shadow-[4px_0_4px_-2px_rgba(0,0,0,0.05)] w-[120px] min-w-[120px] max-w-[120px] top-[40px]" onClick={() => handleSort("avgPrice")}>
                                     <div className="flex items-center justify-end gap-2">
                                         Avg. Price <SortIcon field="avgPrice" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("totalCogs")}>
+
+                                <th className="p-4 text-right cursor-pointer hover:bg-emerald-50 transition-colors bg-emerald-50 w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("revenue")}>
                                     <div className="flex items-center justify-end gap-2">
-                                        COGS <SortIcon field="totalCogs" />
+                                        <span className="overflow-hidden whitespace-nowrap">Revenue</span> <SortIcon field="revenue" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("marketplaceCommission")}>
+                                <th className="p-4 text-right cursor-pointer hover:bg-emerald-50 transition-colors bg-emerald-50 w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("discountPoints")}>
                                     <div className="flex items-center justify-end gap-2">
-                                        Comm. <SortIcon field="marketplaceCommission" />
+                                        <span className="overflow-hidden whitespace-nowrap">Points</span> <SortIcon field="discountPoints" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("logisticsCost")}>
+                                <th className="p-4 text-right cursor-pointer hover:bg-emerald-50 transition-colors bg-emerald-50 w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("partnerPrograms")}>
                                     <div className="flex items-center justify-end gap-2">
-                                        Logistics <SortIcon field="logisticsCost" />
+                                        <span className="overflow-hidden whitespace-nowrap">Partners</span> <SortIcon field="partnerPrograms" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("acquiringCost")}>
-                                    <div className="flex items-center justify-end gap-2">
-                                        Acquiring <SortIcon field="acquiringCost" />
+                                <th className="p-4 text-right cursor-pointer hover:bg-emerald-50 transition-colors border-r border-emerald-100 bg-emerald-50 w-[140px] min-w-[140px] max-w-[140px] sticky top-[40px] z-40" onClick={() => handleSort("totalSalesRevenue")}>
+                                    <div className="flex items-center justify-end gap-2 text-emerald-700">
+                                        <span className="overflow-hidden whitespace-nowrap">Total Sales</span> <SortIcon field="totalSalesRevenue" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("returnsCost")}>
+                                <th className="p-4 text-right cursor-pointer hover:bg-rose-50 transition-colors bg-rose-50 w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("totalCogs")}>
                                     <div className="flex items-center justify-end gap-2">
-                                        Returns <SortIcon field="returnsCost" />
+                                        <span className="overflow-hidden whitespace-nowrap">COGS</span> <SortIcon field="totalCogs" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("additionalServicesCost")}>
+                                <th className="p-4 text-right cursor-pointer hover:bg-rose-50 transition-colors bg-rose-50 w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("marketplaceCommission")}>
                                     <div className="flex items-center justify-end gap-2">
-                                        Services <SortIcon field="additionalServicesCost" />
+                                        <span className="overflow-hidden whitespace-nowrap">Comm.</span> <SortIcon field="marketplaceCommission" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("crossDocking")}>
+                                <th className="p-4 text-right cursor-pointer hover:bg-rose-50 transition-colors bg-rose-50 w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("logisticsCost")}>
                                     <div className="flex items-center justify-end gap-2">
-                                        Cross Docking <SortIcon field="crossDocking" />
+                                        <span className="overflow-hidden whitespace-nowrap">Logistics</span> <SortIcon field="logisticsCost" />
+                                    </div>
+                                </th>
+                                <th className="p-4 text-right cursor-pointer hover:bg-rose-50 transition-colors bg-rose-50 w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("acquiringCost")}>
+                                    <div className="flex items-center justify-end gap-2">
+                                        <span className="overflow-hidden whitespace-nowrap">Acquiring</span> <SortIcon field="acquiringCost" />
+                                    </div>
+                                </th>
+                                <th className="p-4 text-right cursor-pointer hover:bg-rose-50 transition-colors bg-rose-50 w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("returnsCost")}>
+                                    <div className="flex items-center justify-end gap-2">
+                                        <span className="overflow-hidden whitespace-nowrap">Returns</span> <SortIcon field="returnsCost" />
+                                    </div>
+                                </th>
+                                <th className="p-4 text-right cursor-pointer hover:bg-rose-50 transition-colors bg-rose-50 w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("additionalServicesCost")}>
+                                    <div className="flex items-center justify-end gap-2">
+                                        <span className="overflow-hidden whitespace-nowrap">Services</span> <SortIcon field="additionalServicesCost" />
+                                    </div>
+                                </th>
+                                <th className="p-4 text-right cursor-pointer hover:bg-rose-50 transition-colors bg-rose-50 w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("crossDocking")}>
+                                    <div className="flex items-center justify-end gap-2">
+                                        <span className="overflow-hidden whitespace-nowrap">Cross Docking</span> <SortIcon field="crossDocking" />
                                     </div>
                                 </th>
 
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("finalPromotionCost")}>
+                                <th className="p-4 text-right cursor-pointer hover:bg-rose-50 transition-colors bg-rose-50 w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("finalPromotionCost")}>
                                     <div className="flex items-center justify-end gap-2">
-                                        Ads <SortIcon field="finalPromotionCost" />
+                                        <span className="overflow-hidden whitespace-nowrap">Ads</span> <SortIcon field="finalPromotionCost" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("incomeTax")}>
+                                <th className="p-4 text-right cursor-pointer hover:bg-rose-50 transition-colors bg-rose-50 w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("incomeTax")}>
                                     <div className="flex items-center justify-end gap-2">
-                                        Tax <SortIcon field="incomeTax" />
+                                        <span className="overflow-hidden whitespace-nowrap">Tax</span> <SortIcon field="incomeTax" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("totalCostsWithTax")}>
-                                    <div className="flex items-center justify-end gap-2">
-                                        Total Costs <SortIcon field="totalCostsWithTax" />
+                                <th className="p-4 text-right cursor-pointer hover:bg-rose-50 transition-colors border-r border-rose-100 bg-rose-50 w-[140px] min-w-[140px] max-w-[140px] sticky top-[40px] z-40" onClick={() => handleSort("totalCostsWithTax")}>
+                                    <div className="flex items-center justify-end gap-2 text-rose-700">
+                                        <span className="overflow-hidden whitespace-nowrap">Total Costs</span> <SortIcon field="totalCostsWithTax" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("profit")}>
+                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("profit")}>
                                     <div className="flex items-center justify-end gap-2">
-                                        Profit <SortIcon field="profit" />
+                                        <span className="overflow-hidden whitespace-nowrap">Profit</span> <SortIcon field="profit" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors" onClick={() => handleSort("margin")}>
+                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("margin")}>
                                     <div className="flex items-center justify-end gap-2">
-                                        Margin <SortIcon field="margin" />
+                                        <span className="overflow-hidden whitespace-nowrap">Margin</span> <SortIcon field="margin" />
                                     </div>
                                 </th>
                             </tr>
                         </thead>
                         <tbody className="[&_td]:border-b [&_td]:border-slate-100">
                             {sortedArticles.map((article) => (
-                                <tr key={article.sku} className="hover:bg-slate-50 transition-colors">
+                                <tr key={article.sku} className="hover:bg-slate-50 transition-colors group">
                                     <td className="p-4 font-mono text-xs sticky left-0 bg-white z-10 border-r border-slate-200 min-w-[400px] w-[400px] max-w-[400px]" title={article.name}>
                                         <div className="flex flex-col truncate">
                                             <span className="truncate">{article.sku}</span>
                                         </div>
                                     </td>
-                                    <td className="p-4 text-right sticky left-[400px] bg-white z-10 border-r border-slate-200 shadow-[4px_0_4px_-2px_rgba(0,0,0,0.05)] min-w-[120px]">
+                                    <td className="p-4 text-right sticky left-[400px] bg-white z-10 border-r border-slate-200 shadow-[4px_0_4px_-2px_rgba(0,0,0,0.05)] w-[120px] min-w-[120px] max-w-[120px]">
                                         <div className="flex flex-col items-end">
                                             <span className="font-medium">{formatNumber(article.deliveredItems)}</span>
-                                            <span className="text-[10px] text-slate-400">
+                                            <span className="text-[10px] text-slate-400 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
                                                 {totalDelivered > 0 ? ((article.deliveredItems / totalDelivered) * 100).toFixed(1) : "0.0"}%
                                             </span>
                                         </div>
                                     </td>
-                                    <td className="p-4 text-right">{formatNumber(article.orderedItems)}</td>
-                                    <td className="p-4 text-right font-medium">{formatCurrency(article.revenue)}</td>
-                                    <td className="p-4 text-right text-slate-500">{formatCurrency(article.discountPoints)}</td>
-                                    <td className="p-4 text-right text-slate-500">{formatCurrency(article.partnerPrograms)}</td>
-                                    <td className="p-4 text-right font-bold text-blue-600">{formatCurrency(article.totalSalesRevenue)}</td>
-                                    <td className="p-4 text-right font-medium text-slate-700">{formatCurrency((article as any).avgPrice)}</td>
-                                    <td className="p-4 text-right text-slate-500">{renderWithPercent(article.totalCogs, article.totalSalesRevenue)}</td>
-                                    <td className="p-4 text-right text-slate-500">{renderWithPercent(article.marketplaceCommission, article.totalSalesRevenue)}</td>
-                                    <td className="p-4 text-right text-slate-500">{renderWithPercent(article.logisticsCost, article.totalSalesRevenue)}</td>
-                                    <td className="p-4 text-right text-slate-500">{renderWithPercent(article.acquiringCost, article.totalSalesRevenue)}</td>
-                                    <td className="p-4 text-right text-slate-500">{renderWithPercent(article.returnsCost, article.totalSalesRevenue)}</td>
-                                    <td className="p-4 text-right text-slate-500">{renderWithPercent(article.additionalServicesCost, article.totalSalesRevenue)}</td>
-                                    <td className="p-4 text-right text-red-600/70">{renderWithPercent(article.crossDocking, article.totalSalesRevenue)}</td>
+                                    <td className="p-4 text-right font-medium text-slate-700 sticky left-[520px] bg-white z-10 border-r border-slate-200 w-[120px] min-w-[120px] max-w-[120px] shadow-[4px_0_4px_-2px_rgba(0,0,0,0.05)]">{formatCurrency((article as any).avgPrice)}</td>
 
-                                    <td className="p-4 text-right text-red-600/70">{renderWithPercent(article.finalPromotionCost, article.totalSalesRevenue)}</td>
-                                    <td className="p-4 text-right text-red-600/70">{renderWithPercent(article.incomeTax, article.totalSalesRevenue)}</td>
-                                    <td className="p-4 text-right text-red-600 font-medium">{renderWithPercent(article.totalCostsWithTax, article.totalSalesRevenue)}</td>
-                                    <td className={cn("p-4 text-right font-bold", article.profit > 0 ? "text-emerald-600" : "text-red-600")}>
+                                    <td className="p-4 text-right font-medium w-[110px] min-w-[110px] max-w-[110px]">{formatCurrency(article.revenue)}</td>
+                                    <td className="p-4 text-right text-slate-500 w-[110px] min-w-[110px] max-w-[110px]">{formatCurrency(article.discountPoints)}</td>
+                                    <td className="p-4 text-right text-slate-500 w-[110px] min-w-[110px] max-w-[110px]">{formatCurrency(article.partnerPrograms)}</td>
+                                    <td className="p-4 text-right font-bold text-emerald-700 border-r border-emerald-100 bg-emerald-50 w-[140px] min-w-[140px] max-w-[140px]">{formatCurrency(article.totalSalesRevenue)}</td>
+                                    <td className="p-4 text-right text-red-600/70 w-[110px] min-w-[110px] max-w-[110px]">{renderWithPercent(article.totalCogs, article.totalSalesRevenue)}</td>
+                                    <td className="p-4 text-right text-red-600/70 w-[110px] min-w-[110px] max-w-[110px]">{renderWithPercent(article.marketplaceCommission, article.totalSalesRevenue)}</td>
+                                    <td className="p-4 text-right text-red-600/70 w-[110px] min-w-[110px] max-w-[110px]">{renderWithPercent(article.logisticsCost, article.totalSalesRevenue)}</td>
+                                    <td className="p-4 text-right text-red-600/70 w-[110px] min-w-[110px] max-w-[110px]">{renderWithPercent(article.acquiringCost, article.totalSalesRevenue)}</td>
+                                    <td className="p-4 text-right text-red-600/70 w-[110px] min-w-[110px] max-w-[110px]">{renderWithPercent(article.returnsCost, article.totalSalesRevenue)}</td>
+                                    <td className="p-4 text-right text-red-600/70 w-[110px] min-w-[110px] max-w-[110px]">{renderWithPercent(article.additionalServicesCost, article.totalSalesRevenue)}</td>
+                                    <td className="p-4 text-right text-red-600/70 w-[110px] min-w-[110px] max-w-[110px]">{renderWithPercent(article.crossDocking, article.totalSalesRevenue)}</td>
+
+                                    <td className="p-4 text-right text-red-600/70 w-[110px] min-w-[110px] max-w-[110px]">{renderWithPercent(article.finalPromotionCost, article.totalSalesRevenue)}</td>
+                                    <td className="p-4 text-right text-red-600/70 w-[110px] min-w-[110px] max-w-[110px]">{renderWithPercent(article.incomeTax, article.totalSalesRevenue)}</td>
+                                    <td className="p-4 text-right text-rose-700 font-medium border-r border-rose-100 bg-rose-50 w-[140px] min-w-[140px] max-w-[140px]">{renderWithPercent(article.totalCostsWithTax, article.totalSalesRevenue)}</td>
+                                    <td className={cn("p-4 text-right font-bold w-[110px] min-w-[110px] max-w-[110px]", article.profit > 0 ? "text-emerald-600" : "text-red-600")}>
                                         {formatCurrency(article.profit)}
                                     </td>
-                                    <td className={cn("p-4 text-right", article.margin > 0 ? "text-emerald-600" : "text-red-600")}>
+                                    <td className={cn("p-4 text-right w-[110px] min-w-[110px] max-w-[110px]", article.margin > 0 ? "text-emerald-600" : "text-red-600")}>
                                         {article.margin.toFixed(1)}%
                                     </td>
                                 </tr>

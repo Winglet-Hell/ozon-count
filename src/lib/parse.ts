@@ -42,6 +42,7 @@ export interface AnalysisResult {
     promotionCost: number;
     totalCogs: number;
     articles: ArticleRow[];
+    period?: string;
 }
 
 export const parseCurrency = (value: string): number => {
@@ -69,9 +70,29 @@ export const parseReport = (file: File): Promise<AnalysisResult> => {
 
             let headerLineIndex = -1;
 
+            let period = "";
+
             // Look for the header line which must contain "Выручка" and "Баллы за скидки"
             for (let i = 0; i < Math.min(lines.length, 20); i++) {
-                if (lines[i].includes("Выручка") && lines[i].includes("Баллы за скидки")) {
+                const line = lines[i];
+
+                // Try to find period
+                if (line.toLowerCase().includes("период") && !period) {
+                    // Try to extract date range pattern dd.mm.yyyy - dd.mm.yyyy
+                    const dateMatch = line.match(/(\d{2}\.\d{2}\.\d{4})\s*-\s*(\d{2}\.\d{2}\.\d{4})/);
+                    if (dateMatch) {
+                        period = `Period: ${dateMatch[1]} - ${dateMatch[2]}`;
+                    } else {
+                        // Fallback: replace Russian "Период" with "Period"
+                        let cleanLine = line.replace(/^["';]+|["';]+$/g, '').trim();
+                        // Replace "за период" or just "период" with "Period:"
+                        cleanLine = cleanLine.replace(/за\s+период/i, "Period:");
+                        cleanLine = cleanLine.replace(/период/i, "Period:");
+                        period = cleanLine;
+                    }
+                }
+
+                if (line.includes("Выручка") && line.includes("Баллы за скидки")) {
                     headerLineIndex = i;
                     break;
                 }
@@ -203,6 +224,7 @@ export const parseReport = (file: File): Promise<AnalysisResult> => {
                     const articles = Array.from(articlesMap.values());
 
                     resolve({
+                        period,
                         revenue,
                         discountPoints,
                         partnerPrograms,

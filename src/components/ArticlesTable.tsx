@@ -327,12 +327,12 @@ export function ArticlesTable({ articles }: ArticlesTableProps) {
                                         <span className="overflow-hidden whitespace-nowrap">Total Costs</span> <SortIcon field="totalCostsWithTax" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("profit")}>
+                                <th className="p-4 text-right cursor-pointer bg-slate-50 hover:bg-slate-100 transition-colors w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("profit")}>
                                     <div className="flex items-center justify-end gap-2">
                                         <span className="overflow-hidden whitespace-nowrap">Profit</span> <SortIcon field="profit" />
                                     </div>
                                 </th>
-                                <th className="p-4 text-right cursor-pointer hover:bg-slate-100 transition-colors w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("margin")}>
+                                <th className="p-4 text-right cursor-pointer bg-slate-50 hover:bg-slate-100 transition-colors w-[110px] min-w-[110px] max-w-[110px] sticky top-[40px] z-40" onClick={() => handleSort("margin")}>
                                     <div className="flex items-center justify-end gap-2">
                                         <span className="overflow-hidden whitespace-nowrap">Margin</span> <SortIcon field="margin" />
                                     </div>

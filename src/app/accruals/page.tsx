@@ -44,13 +44,13 @@ export default function AccrualsPage() {
     const fetchDefaultCogs = async () => {
       try {
         // Try XLSX template first
-        const xlsxRes = await fetch("/Шаблон для обновления цен_17.06.26 (1).xlsx");
+        const xlsxRes = await fetch("/Шаблон для обновления цен_17.06.26 (3).xlsx");
         if (xlsxRes.ok) {
           const blob = await xlsxRes.blob();
-          const file = new File([blob], "Шаблон для обновления цен_17.06.26 (1).xlsx");
+          const file = new File([blob], "Шаблон для обновления цен_17.06.26 (3).xlsx");
           const parsed = await parseCogsXlsx(file);
           setSkuCogs(parsed);
-          setCogsFileName("Шаблон для обновления цен_17.06.26 (1).xlsx (авто)");
+          setCogsFileName("Шаблон для обновления цен_17.06.26 (3).xlsx (авто)");
           return;
         }
 

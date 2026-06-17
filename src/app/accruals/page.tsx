@@ -268,7 +268,9 @@ export default function AccrualsPage() {
         group: "Комиссии (Моделирование)",
         type: "Смоделированная комиссия",
         amount: -actualTotalInflow * (targetCommissionRate / 100),
-        row: -1
+        pctOfInflow: 0,
+        pctOfOutflow: 0,
+        pctOfTotalInflowForOutflow: 0
       });
     }
     if (actualLogisticsRate === 0 && targetLogisticsRate > 0) {
@@ -276,7 +278,9 @@ export default function AccrualsPage() {
         group: "Логистика (Моделирование)",
         type: "Смоделированная логистика",
         amount: -actualTotalInflow * (targetLogisticsRate / 100),
-        row: -1
+        pctOfInflow: 0,
+        pctOfOutflow: 0,
+        pctOfTotalInflowForOutflow: 0
       });
     }
   }

@@ -7,7 +7,16 @@ import { Header } from "@/components/Header";
 import { parseAccrualsReport, parseCogsCsv, parseCogsXlsx, type AccrualsSummary, type AccrualsBreakdownItem } from "@/lib/parseAccruals";
 import { cn } from "@/lib/utils";
 
-const formatCurrency = (val: number): string => {
+const formatCurrency = (val: number, compact: boolean = false): string => {
+  if (compact && Math.abs(val) >= 1000) {
+    return new Intl.NumberFormat("ru-RU", {
+      style: "currency",
+      currency: "RUB",
+      notation: "compact",
+      minimumFractionDigits: 0,
+      maximumFractionDigits: 1
+    }).format(val);
+  }
   return new Intl.NumberFormat("ru-RU", {
     style: "currency",
     currency: "RUB",
@@ -25,6 +34,19 @@ const getCategoryFromArticle = (article: string): string => {
   return "Прочее";
 };
 
+const isCommission = (group: string, type: string): boolean => {
+  const g = group.toLowerCase();
+  const t = type.toLowerCase();
+  return g.includes("вознаграждение") || g.includes("комисси") || t.includes("вознаграждение") || t.includes("комисси");
+};
+
+const isLogistics = (group: string, type: string): boolean => {
+  const g = group.toLowerCase();
+  const t = type.toLowerCase();
+  const keywords = ["логистик", "доставк", "магистрал", "обработк", "сборк", "склад", "хранени", "кросс-док", "размещен", "упаковк", "сортировк"];
+  return keywords.some(k => g.includes(k) || t.includes(k));
+};
+
 export default function AccrualsPage() {
   const [isDragActive, setIsDragActive] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -38,6 +60,12 @@ export default function AccrualsPage() {
   const [cogsFileName, setCogsFileName] = useState<string | null>(null);
   const [isCogsLoading, setIsCogsLoading] = useState(false);
   const [cogsError, setCogsError] = useState<string | null>(null);
+
+  // Forecasting States
+  const [isForecastMode, setIsForecastMode] = useState(false);
+  const [commissionRate, setCommissionRate] = useState<number | null>(null);
+  const [logisticsRate, setLogisticsRate] = useState<number | null>(null);
+  const [cogsRate, setCogsRate] = useState<number | null>(null);
 
   // Auto-load default себестоимость file on mount (prefers XLSX template if available)
   useEffect(() => {
@@ -142,13 +170,163 @@ export default function AccrualsPage() {
     }
   };
 
+  // Calculate COGS and real economy metrics (unadjusted)
+  let baseProductionCogs = 0;
+  const missingCogsSkus: Record<string, { qty: number }> = {};
+
+  if (result && result.skuTransactions) {
+    result.skuTransactions.forEach((tx) => {
+      const isSale = tx.group === "Продажи" && tx.type === "Выручка";
+      const isReturn = tx.group === "Возвраты" && tx.type === "Возврат выручки";
+
+      if (isSale || isReturn) {
+        const cogsRateVal = skuCogs[tx.sku] || 0;
+        const qty = tx.quantity;
+
+        if (cogsRateVal === 0) {
+          if (!missingCogsSkus[tx.sku]) {
+            missingCogsSkus[tx.sku] = { qty: 0 };
+          }
+          missingCogsSkus[tx.sku].qty += qty;
+        }
+
+        const rowCogs = qty * cogsRateVal;
+        if (isSale) {
+          baseProductionCogs += rowCogs;
+        } else if (isReturn) {
+          baseProductionCogs -= rowCogs;
+        }
+      }
+    });
+  }
+
+  // Calculate actual base sums for Ozon commission and logistics
+  let actualCommissionSum = 0;
+  let actualLogisticsSum = 0;
+  if (result) {
+    result.breakdown.forEach((item) => {
+      if (isCommission(item.group, item.type)) {
+        actualCommissionSum += -item.amount; // commissions are negative, sum as positive
+      } else if (isLogistics(item.group, item.type)) {
+        actualLogisticsSum += -item.amount; // logistics are negative, sum as positive
+      }
+    });
+  }
+
+  // Actual (un-adjusted) Ozon Flow Metrics
+  const actualTotalInflow = result ? result.totalInflow : 0;
+  const actualTotalOutflow = result ? result.totalOutflow : 0;
+  const actualNetResult = result ? result.netResult : 0;
+  const actualOzonMargin = actualTotalInflow > 0 ? (actualNetResult / actualTotalInflow) * 100 : 0;
+
+  // Actual rates relative to inflow
+  const actualCommissionRate = actualTotalInflow > 0 ? (actualCommissionSum / actualTotalInflow) * 100 : 0;
+  const actualLogisticsRate = actualTotalInflow > 0 ? (actualLogisticsSum / actualTotalInflow) * 100 : 0;
+  const actualCogsRate = actualTotalInflow > 0 ? (baseProductionCogs / actualTotalInflow) * 100 : 0;
+
+  // Sync sliders to report actual rates when a new report/cogs loads
+  useEffect(() => {
+    if (result) {
+      setCommissionRate(actualCommissionRate);
+      setLogisticsRate(actualLogisticsRate);
+      setCogsRate(actualCogsRate);
+    } else {
+      setCommissionRate(null);
+      setLogisticsRate(null);
+      setCogsRate(null);
+    }
+  }, [result, actualCommissionRate, actualLogisticsRate, actualCogsRate]);
+
+  // Target rates (user selected or fallback to actuals)
+  const targetCommissionRate = isForecastMode && commissionRate !== null ? commissionRate : actualCommissionRate;
+  const targetLogisticsRate = isForecastMode && logisticsRate !== null ? logisticsRate : actualLogisticsRate;
+  const targetCogsRate = isForecastMode && cogsRate !== null ? cogsRate : actualCogsRate;
+
+  // Generate adjusted breakdown and totals
+  const adjustedBreakdownItems = result ? result.breakdown.map((item) => {
+    let amt = item.amount;
+    if (isForecastMode && item.amount < 0) {
+      if (isCommission(item.group, item.type)) {
+        amt = actualCommissionRate > 0 
+          ? item.amount * (targetCommissionRate / actualCommissionRate)
+          : item.amount;
+      } else if (isLogistics(item.group, item.type)) {
+        amt = actualLogisticsRate > 0 
+          ? item.amount * (targetLogisticsRate / actualLogisticsRate)
+          : item.amount;
+      }
+    }
+    return {
+      ...item,
+      amount: amt
+    };
+  }) : [];
+
+  if (isForecastMode && result) {
+    if (actualCommissionRate === 0 && targetCommissionRate > 0) {
+      adjustedBreakdownItems.push({
+        group: "Комиссии (Моделирование)",
+        type: "Смоделированная комиссия",
+        amount: -actualTotalInflow * (targetCommissionRate / 100),
+        row: -1
+      });
+    }
+    if (actualLogisticsRate === 0 && targetLogisticsRate > 0) {
+      adjustedBreakdownItems.push({
+        group: "Логистика (Моделирование)",
+        type: "Смоделированная логистика",
+        amount: -actualTotalInflow * (targetLogisticsRate / 100),
+        row: -1
+      });
+    }
+  }
+
+  let adjustedTotalInflow = actualTotalInflow;
+  let adjustedTotalOutflow = actualTotalOutflow;
+
+  if (isForecastMode && result) {
+    adjustedBreakdownItems.forEach((item, i) => {
+      const origItem = i < result.breakdown.length ? result.breakdown[i] : null;
+      const delta = origItem ? item.amount - origItem.amount : item.amount;
+      
+      if (delta !== 0) {
+        if ((origItem && origItem.amount < 0) || !origItem) {
+          adjustedTotalOutflow += delta;
+        } else {
+          adjustedTotalInflow += delta;
+        }
+      }
+    });
+  }
+
+  const adjustedNetResultFromFlows = adjustedTotalInflow + adjustedTotalOutflow;
+
+  const finalBreakdown = adjustedBreakdownItems.map((item) => {
+    const pctOfInflow = item.amount > 0 ? (item.amount / (adjustedTotalInflow || 1)) * 100 : 0;
+    const pctOfOutflow = item.amount < 0 ? (Math.abs(item.amount) / (Math.abs(adjustedTotalOutflow) || 1)) * 100 : 0;
+    const pctOfTotalInflowForOutflow = item.amount < 0 ? (Math.abs(item.amount) / (adjustedTotalInflow || 1)) * 100 : 0;
+
+    return {
+      ...item,
+      pctOfInflow,
+      pctOfOutflow,
+      pctOfTotalInflowForOutflow
+    };
+  });
+
+  finalBreakdown.sort((a, b) => {
+    if (a.amount > 0 && b.amount < 0) return -1;
+    if (a.amount < 0 && b.amount > 0) return 1;
+    return Math.abs(b.amount) - Math.abs(a.amount);
+  });
+
   // Get aggregated breakdown based on groupingMode
-  const getAggregatedBreakdown = useCallback(() => {
+  const getAggregatedBreakdown = () => {
     if (!result) return [];
-    if (groupingMode === "extended") return result.breakdown;
+    if (groupingMode === "extended") return finalBreakdown;
 
     const map: Record<string, { group: string; type: string; amount: number }> = {};
-    result.breakdown.forEach((item) => {
+    finalBreakdown.forEach((item) => {
       if (!map[item.group]) {
         map[item.group] = {
           group: item.group,
@@ -160,13 +338,16 @@ export default function AccrualsPage() {
     });
 
     const list = Object.values(map);
-    const totalInflow = result.totalInflow;
-    const totalOutflow = result.totalOutflow;
+    list.sort((a, b) => {
+      if (a.amount > 0 && b.amount < 0) return -1;
+      if (a.amount < 0 && b.amount > 0) return 1;
+      return Math.abs(b.amount) - Math.abs(a.amount);
+    });
 
     return list.map((item) => {
-      const pctOfInflow = item.amount > 0 ? (item.amount / totalInflow) * 100 : 0;
-      const pctOfOutflow = item.amount < 0 ? (Math.abs(item.amount) / Math.abs(totalOutflow)) * 100 : 0;
-      const pctOfTotalInflowForOutflow = item.amount < 0 ? (Math.abs(item.amount) / totalInflow) * 100 : 0;
+      const pctOfInflow = item.amount > 0 ? (item.amount / (adjustedTotalInflow || 1)) * 100 : 0;
+      const pctOfOutflow = item.amount < 0 ? (Math.abs(item.amount) / (Math.abs(adjustedTotalOutflow) || 1)) * 100 : 0;
+      const pctOfTotalInflowForOutflow = item.amount < 0 ? (Math.abs(item.amount) / (adjustedTotalInflow || 1)) * 100 : 0;
 
       return {
         group: item.group,
@@ -177,10 +358,10 @@ export default function AccrualsPage() {
         pctOfTotalInflowForOutflow
       };
     });
-  }, [result, groupingMode]);
+  };
 
   // Get hierarchical breakdown
-  const getHierarchicalBreakdown = useCallback(() => {
+  const getHierarchicalBreakdown = () => {
     if (!result) return [];
 
     const map: Record<string, {
@@ -189,7 +370,7 @@ export default function AccrualsPage() {
       children: { type: string; amount: number }[];
     }> = {};
 
-    result.breakdown.forEach((item) => {
+    finalBreakdown.forEach((item) => {
       if (!map[item.group]) {
         map[item.group] = {
           group: item.group,
@@ -204,21 +385,18 @@ export default function AccrualsPage() {
       });
     });
 
-    const totalInflow = result.totalInflow;
-    const totalOutflow = result.totalOutflow;
-
     const list = Object.values(map);
 
     const resolvedList = list.map((item) => {
-      const pctOfInflow = item.amount > 0 ? (item.amount / totalInflow) * 100 : 0;
-      const pctOfOutflow = item.amount < 0 ? (Math.abs(item.amount) / Math.abs(totalOutflow)) * 100 : 0;
-      const pctOfTotalInflowForOutflow = item.amount < 0 ? (Math.abs(item.amount) / totalInflow) * 100 : 0;
+      const pctOfInflow = item.amount > 0 ? (item.amount / (adjustedTotalInflow || 1)) * 100 : 0;
+      const pctOfOutflow = item.amount < 0 ? (Math.abs(item.amount) / (Math.abs(adjustedTotalOutflow) || 1)) * 100 : 0;
+      const pctOfTotalInflowForOutflow = item.amount < 0 ? (Math.abs(item.amount) / (adjustedTotalInflow || 1)) * 100 : 0;
 
       const children = item.children
         .map((child) => {
-          const cPctOfInflow = child.amount > 0 ? (child.amount / totalInflow) * 100 : 0;
-          const cPctOfOutflow = child.amount < 0 ? (Math.abs(child.amount) / Math.abs(totalOutflow)) * 100 : 0;
-          const cPctOfTotalInflowForOutflow = child.amount < 0 ? (Math.abs(child.amount) / totalInflow) * 100 : 0;
+          const cPctOfInflow = child.amount > 0 ? (child.amount / (adjustedTotalInflow || 1)) * 100 : 0;
+          const cPctOfOutflow = child.amount < 0 ? (Math.abs(child.amount) / (Math.abs(adjustedTotalOutflow) || 1)) * 100 : 0;
+          const cPctOfTotalInflowForOutflow = child.amount < 0 ? (Math.abs(child.amount) / (adjustedTotalInflow || 1)) * 100 : 0;
 
           return {
             type: child.type,
@@ -247,10 +425,10 @@ export default function AccrualsPage() {
     });
 
     return resolvedList;
-  }, [result]);
+  };
 
   // Filter hierarchical items based on activeFilter
-  const filteredHierarchical = useCallback(() => {
+  const filteredHierarchical = (() => {
     const list = getHierarchicalBreakdown();
     
     return list.map(groupItem => {
@@ -272,7 +450,7 @@ export default function AccrualsPage() {
       if (activeFilter === "outflow") return groupItem.children.length > 0 && groupItem.filteredSum < 0;
       return groupItem.children.length > 0;
     });
-  }, [getHierarchicalBreakdown, activeFilter])();
+  })();
 
   // Filter flat breakdown items
   const filteredBreakdown = getAggregatedBreakdown().filter((item) => {
@@ -281,41 +459,22 @@ export default function AccrualsPage() {
     return true;
   });
 
-  // Calculate COGS and real economy metrics
-  let totalProductionCogs = 0;
-  const missingCogsSkus: Record<string, { qty: number }> = {};
+  const totalProductionCogs = (isForecastMode && actualCogsRate === 0)
+    ? (adjustedTotalInflow * (targetCogsRate / 100))
+    : baseProductionCogs * (actualCogsRate > 0 ? targetCogsRate / actualCogsRate : 1);
 
-  if (result && result.skuTransactions) {
-    result.skuTransactions.forEach((tx) => {
-      const isSale = tx.group === "Продажи" && tx.type === "Выручка";
-      const isReturn = tx.group === "Возвраты" && tx.type === "Возврат выручки";
-
-      if (isSale || isReturn) {
-        const cogsRate = skuCogs[tx.sku] || 0;
-        const qty = tx.quantity;
-
-        if (cogsRate === 0) {
-          if (!missingCogsSkus[tx.sku]) {
-            missingCogsSkus[tx.sku] = { qty: 0 };
-          }
-          missingCogsSkus[tx.sku].qty += qty;
-        }
-
-        const rowCogs = qty * cogsRate;
-        if (isSale) {
-          totalProductionCogs += rowCogs;
-        } else if (isReturn) {
-          totalProductionCogs -= rowCogs;
-        }
-      }
-    });
-  }
-
-  const taxableProfit = result ? result.netResult - totalProductionCogs : 0;
+  const taxableProfit = adjustedTotalInflow + adjustedTotalOutflow - totalProductionCogs;
   const taxRate = 0.25; // Ставка налога на прибыль ОСНО на 2026 год составляет 25%
   const taxAmount = Math.max(0, taxableProfit * taxRate);
   const adjustedNetResult = taxableProfit - taxAmount;
-  const adjustedMargin = result && result.totalInflow ? (adjustedNetResult / result.totalInflow) * 100 : 0;
+  const adjustedMargin = adjustedTotalInflow ? (adjustedNetResult / adjustedTotalInflow) * 100 : 0;
+
+  // Actual (un-adjusted) Real Economy Metrics
+  const actualProductionCogs = baseProductionCogs;
+  const actualTaxableProfit = actualNetResult - actualProductionCogs;
+  const actualTaxAmount = Math.max(0, actualTaxableProfit * taxRate);
+  const actualRealNetResult = actualTaxableProfit - actualTaxAmount;
+  const actualRealMargin = actualTotalInflow ? (actualRealNetResult / actualTotalInflow) * 100 : 0;
 
   // Category breakdown calculations
   const categoryData: Record<string, { sold: number; returned: number; revenue: number }> = {
@@ -359,121 +518,131 @@ export default function AccrualsPage() {
   const totalNetItems = activeCategories.reduce((sum, cat) => sum + cat.net, 0);
 
   return (
-    <main className="min-h-screen bg-slate-50 flex flex-col">
+    <main className="min-h-screen bg-slate-50/50 flex flex-col selection:bg-blue-500/20">
       <Header
         onUploadClick={handleReset}
         showUploadButton={!!result}
         period={result?.period || undefined}
       />
 
-      <div className="flex-1 flex flex-col p-6 w-full">
-        <div className="w-full space-y-8 transition-all duration-300">
+      <div className="flex-1 flex flex-col px-4 sm:px-6 lg:px-8 py-8 w-full max-w-7xl mx-auto">
+        <div className="w-full space-y-8 transition-all duration-500 ease-out">
           
           {!result && (
-            <div className="mt-20 max-w-xl mx-auto w-full">
-              <div className="text-center space-y-4 mb-8">
-                <h2 className="text-3xl font-extrabold text-slate-900 tracking-tight">
-                  Анализ начислений Ozon
+            <div className="mt-16 max-w-2xl mx-auto w-full">
+              <div className="text-center space-y-4 mb-10">
+                <h2 className="text-4xl font-extrabold text-slate-900 tracking-tight">
+                  Анализ начислений <span className="text-blue-600">Ozon</span>
                 </h2>
-                <p className="text-slate-600 max-w-md mx-auto">
-                  Загрузите Excel-файл отчета начислений (например, <code className="text-xs bg-slate-100 px-1.5 py-0.5 rounded font-mono">Отчет по начислениям_*.xlsx</code>), чтобы детально проанализировать все приходы и списания по операциям.
+                <p className="text-slate-500 text-lg max-w-lg mx-auto leading-relaxed">
+                  Загрузите отчет о начислениях, чтобы увидеть детальную расшифровку всех операций, комиссий и логистики.
                 </p>
               </div>
 
-              <div className="bg-white rounded-2xl shadow-xl border border-slate-200/60 overflow-hidden p-6 space-y-6">
-                {/* Excel Report File Dropzone */}
-                <div
-                  className={cn(
-                    "p-8 border-2 border-dashed rounded-xl transition-all duration-300 ease-in-out cursor-pointer flex flex-col items-center justify-center gap-3 min-h-[180px]",
-                    isDragActive
-                      ? "border-blue-500 bg-blue-50/50 scale-[0.99]"
-                      : "border-slate-300 hover:border-slate-400 hover:bg-slate-50",
-                    isProcessing && "opacity-50 pointer-events-none"
-                  )}
-                  onDragOver={onDragOver}
-                  onDragLeave={onDragLeave}
-                  onDrop={onDrop}
-                  onClick={() => document.getElementById("xlsx-file-upload")?.click()}
-                >
-                  <input
-                    id="xlsx-file-upload"
-                    type="file"
-                    className="hidden"
-                    accept=".xlsx"
-                    onChange={onFileInputChange}
-                  />
-
-                  <div className="p-3 bg-blue-50 rounded-full text-blue-600 ring-4 ring-blue-500/10">
-                    {isProcessing ? (
-                      <Loader2 className="w-6 h-6 animate-spin" />
-                    ) : (
-                      <FileSpreadsheet className="w-6 h-6" />
+              <div className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200/60 p-2 overflow-hidden">
+                <div className="p-6 sm:p-10 space-y-8 bg-slate-50/50 rounded-[1.25rem]">
+                  {/* Excel Report File Dropzone */}
+                  <div
+                    className={cn(
+                      "relative group p-10 border-2 border-dashed rounded-2xl transition-all duration-300 ease-out cursor-pointer flex flex-col items-center justify-center gap-4 min-h-[240px] overflow-hidden",
+                      isDragActive
+                        ? "border-blue-500 bg-blue-50/80 scale-[0.98]"
+                        : "border-slate-300 hover:border-blue-400 hover:bg-white hover:shadow-xl hover:shadow-blue-500/5",
+                      isProcessing && "opacity-50 pointer-events-none"
                     )}
-                  </div>
+                    onDragOver={onDragOver}
+                    onDragLeave={onDragLeave}
+                    onDrop={onDrop}
+                    onClick={() => document.getElementById("xlsx-file-upload")?.click()}
+                  >
+                    <div className="absolute inset-0 bg-gradient-to-br from-blue-50/0 to-blue-50/0 group-hover:from-blue-50/50 group-hover:to-transparent transition-colors duration-500" />
+                    <input
+                      id="xlsx-file-upload"
+                      type="file"
+                      className="hidden"
+                      accept=".xlsx"
+                      onChange={onFileInputChange}
+                    />
 
-                  <div className="text-center space-y-1">
-                    <p className="text-sm font-semibold text-slate-800">
-                      {isProcessing ? "Обработка и расшифровка Excel..." : "Загрузите отчет по начислениям (.xlsx)"}
-                    </p>
-                    <p className="text-xs text-slate-500">
-                      Перетащите файл или нажмите для выбора
-                    </p>
-                  </div>
-                </div>
-
-                {/* CSV Cogs File Status Bar / Input */}
-                <div className="border border-slate-100 rounded-xl p-4 bg-slate-50/50 flex flex-col sm:flex-row items-center justify-between gap-4">
-                  <div className="flex items-center gap-3 w-full sm:w-auto">
                     <div className={cn(
-                      "p-2.5 rounded-lg",
-                      cogsFileName ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600",
-                      isCogsLoading && "animate-pulse"
+                      "p-4 rounded-2xl transition-all duration-300 relative z-10",
+                      isProcessing ? "bg-blue-100 text-blue-600" : "bg-white shadow-sm border border-slate-100 text-blue-500 group-hover:scale-110 group-hover:shadow-md"
                     )}>
-                      {isCogsLoading ? (
-                        <Loader2 className="w-5 h-5 animate-spin" />
-                      ) : cogsFileName ? (
-                        <Check className="w-5 h-5" />
+                      {isProcessing ? (
+                        <Loader2 className="w-8 h-8 animate-spin" />
                       ) : (
-                        <Info className="w-5 h-5" />
+                        <FileSpreadsheet className="w-8 h-8" />
                       )}
                     </div>
-                    <div>
-                      <h4 className="text-xs font-bold text-slate-700 uppercase tracking-wide">База себестоимости</h4>
-                      <p className="text-xs text-slate-500 font-medium">
-                        {cogsFileName 
-                          ? `${cogsFileName} (${Object.keys(skuCogs).length} артикулов)`
-                          : "Не загружена (себестоимость будет равна 0)"}
+
+                    <div className="text-center space-y-2 relative z-10">
+                      <p className="text-base font-bold text-slate-800">
+                        {isProcessing ? "Обработка отчета..." : "Загрузите отчет Excel (.xlsx)"}
+                      </p>
+                      <p className="text-sm text-slate-500">
+                        Перетащите файл сюда или нажмите для выбора
                       </p>
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2 w-full sm:w-auto justify-end">
-                    <button
-                      onClick={() => document.getElementById("csv-file-upload")?.click()}
-                      className="px-3.5 py-1.5 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-bold rounded-lg shadow-sm hover:border-slate-300 transition-all flex items-center gap-1.5"
-                    >
-                      <Upload className="w-3.5 h-3.5" />
-                      Загрузить CSV / Excel
-                    </button>
-                    <input
-                      id="csv-file-upload"
-                      type="file"
-                      className="hidden"
-                      accept=".csv,.xlsx"
-                      onChange={(e) => {
-                        if (e.target.files && e.target.files[0]) {
-                          handleCogsFile(e.target.files[0]);
-                        }
-                      }}
-                    />
-                  </div>
-                </div>
+                  {/* CSV Cogs File Status */}
+                  <div className="bg-white border border-slate-200/80 rounded-2xl p-5 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-4 transition-all hover:border-slate-300">
+                    <div className="flex items-center gap-3.5 w-full sm:w-auto">
+                      <div className={cn(
+                        "p-3 rounded-xl transition-colors",
+                        cogsFileName ? "bg-emerald-50 text-emerald-600" : "bg-slate-100 text-slate-400",
+                        isCogsLoading && "animate-pulse"
+                      )}>
+                        {isCogsLoading ? (
+                          <Loader2 className="w-5 h-5 animate-spin" />
+                        ) : cogsFileName ? (
+                          <Check className="w-5 h-5" />
+                        ) : (
+                          <Coins className="w-5 h-5" />
+                        )}
+                      </div>
+                      <div>
+                        <h4 className="text-sm font-bold text-slate-800">База себестоимости</h4>
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          {cogsFileName 
+                            ? `${cogsFileName} (${Object.keys(skuCogs).length} арт.)`
+                            : "Не загружена (себестоимость = 0)"}
+                        </p>
+                      </div>
+                    </div>
 
-                {cogsError && (
-                  <div className="p-3 bg-rose-50 text-rose-700 border border-rose-100 rounded-xl text-xs text-center">
-                    {cogsError}
+                    <div className="w-full sm:w-auto flex justify-end">
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          document.getElementById("csv-file-upload")?.click();
+                        }}
+                        className="px-4 py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 text-sm font-semibold rounded-xl shadow-sm transition-all flex items-center gap-2"
+                      >
+                        <Upload className="w-4 h-4" />
+                        Обновить
+                      </button>
+                      <input
+                        id="csv-file-upload"
+                        type="file"
+                        className="hidden"
+                        accept=".csv,.xlsx"
+                        onChange={(e) => {
+                          if (e.target.files && e.target.files[0]) {
+                            handleCogsFile(e.target.files[0]);
+                          }
+                        }}
+                      />
+                    </div>
                   </div>
-                )}
+
+                  {cogsError && (
+                    <div className="p-4 bg-rose-50 text-rose-700 border border-rose-100 rounded-xl text-sm font-medium flex items-center gap-2">
+                      <AlertTriangle className="w-5 h-5 shrink-0" />
+                      {cogsError}
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
           )}
@@ -484,225 +653,387 @@ export default function AccrualsPage() {
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -10 }}
-                className="p-4 bg-rose-50 text-rose-700 rounded-xl border border-rose-200/60 text-sm text-center flex items-center justify-center gap-2 max-w-xl mx-auto"
+                className="p-4 bg-rose-50 text-rose-700 rounded-2xl border border-rose-200/60 text-sm flex items-center gap-3 max-w-2xl mx-auto shadow-sm"
               >
-                <span className="font-semibold">Ошибка:</span> {error}
+                <AlertTriangle className="w-5 h-5 shrink-0" />
+                <span><strong className="font-semibold">Ошибка:</strong> {error}</span>
               </motion.div>
             )}
 
             {result && (
               <motion.div
-                initial={{ opacity: 0, scale: 0.98 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.98 }}
-                transition={{ duration: 0.3 }}
+                initial={{ opacity: 0, y: 20 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -20 }}
+                transition={{ duration: 0.4, ease: "easeOut" }}
                 className="space-y-8"
               >
-                {/* Active Cost Database Status Bar inside Results Dashboard */}
-                <div className="bg-white border border-slate-200/80 rounded-2xl p-4 shadow-sm flex flex-col sm:flex-row items-center justify-between gap-4">
-                  <div className="flex items-center gap-3">
-                    <div className={cn(
-                      "p-2.5 rounded-xl",
-                      cogsFileName ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600",
-                      isCogsLoading && "animate-pulse"
-                    )}>
-                      {isCogsLoading ? (
-                        <Loader2 className="w-5.5 h-5.5 animate-spin" />
-                      ) : cogsFileName ? (
-                        <Check className="w-5.5 h-5.5" />
-                      ) : (
-                        <Info className="w-5.5 h-5.5" />
-                      )}
+                {/* Control Panel: COGS & Forecasting side-by-side on large screens */}
+                <div className="grid lg:grid-cols-2 gap-6">
+                  {/* COGS Status */}
+                  <div className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200/60 p-6 flex flex-col justify-center gap-4">
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="flex items-start gap-4">
+                        <div className={cn(
+                          "p-3 rounded-2xl shrink-0 transition-colors",
+                          cogsFileName ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600",
+                          isCogsLoading && "animate-pulse"
+                        )}>
+                          {isCogsLoading ? (
+                            <Loader2 className="w-6 h-6 animate-spin" />
+                          ) : cogsFileName ? (
+                            <Check className="w-6 h-6" />
+                          ) : (
+                            <AlertTriangle className="w-6 h-6" />
+                          )}
+                        </div>
+                        <div className="space-y-1">
+                          <h4 className="text-base font-bold text-slate-900">
+                            {cogsFileName ? "Себестоимость загружена" : "Себестоимость не учтена"}
+                          </h4>
+                          <p className="text-sm text-slate-500 leading-relaxed">
+                            {cogsFileName 
+                              ? `Активный файл: ${cogsFileName}. Участвует ${Object.keys(skuCogs).length} артикулов.` 
+                              : "Загрузите файл с себестоимостью для расчета реальной чистой прибыли."}
+                          </p>
+                        </div>
+                      </div>
                     </div>
-                    <div>
-                      <h4 className="text-sm font-extrabold text-slate-800">
-                        {cogsFileName ? "Активная база себестоимости" : "База себестоимости не загружена"}
-                      </h4>
-                      <p className="text-xs text-slate-500">
-                        {cogsFileName 
-                          ? `Загружен файл: ${cogsFileName} (всего ${Object.keys(skuCogs).length} товаров)` 
-                          : "Загрузите CSV или Excel файл для расчета реальной маржи с учетом себестоимости."}
-                      </p>
+                    <div className="pt-2">
+                      <button
+                        onClick={() => document.getElementById("csv-file-upload-active")?.click()}
+                        className="w-full sm:w-auto px-5 py-2.5 bg-white border border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-700 text-sm font-semibold rounded-xl shadow-sm transition-all flex items-center justify-center gap-2"
+                      >
+                        <Upload className="w-4 h-4" />
+                        Обновить базу (.csv, .xlsx)
+                      </button>
+                      <input
+                        id="csv-file-upload-active"
+                        type="file"
+                        className="hidden"
+                        accept=".csv,.xlsx"
+                        onChange={(e) => {
+                          if (e.target.files && e.target.files[0]) {
+                            handleCogsFile(e.target.files[0]);
+                          }
+                        }}
+                      />
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => document.getElementById("csv-file-upload-active")?.click()}
-                      className="px-4 py-2 bg-slate-50 border border-slate-200 hover:bg-slate-100 text-slate-700 text-xs font-bold rounded-xl shadow-xs transition-all flex items-center gap-1.5"
-                    >
-                      <Upload className="w-4 h-4" />
-                      Загрузить себестоимость (.csv, .xlsx)
-                    </button>
-                    <input
-                      id="csv-file-upload-active"
-                      type="file"
-                      className="hidden"
-                      accept=".csv,.xlsx"
-                      onChange={(e) => {
-                        if (e.target.files && e.target.files[0]) {
-                          handleCogsFile(e.target.files[0]);
-                        }
-                      }}
-                    />
+                  {/* Forecast Toggle Card */}
+                  <div className={cn(
+                    "rounded-3xl border p-6 flex flex-col justify-center gap-4 transition-all duration-300",
+                    isForecastMode 
+                      ? "bg-blue-600 border-blue-500 shadow-lg shadow-blue-500/20 text-white" 
+                      : "bg-white border-slate-200/60 shadow-[0_8px_30px_rgb(0,0,0,0.04)] text-slate-900"
+                  )}>
+                    <div className="flex items-start justify-between gap-4">
+                      <div className="flex items-start gap-4">
+                        <div className={cn(
+                          "p-3 rounded-2xl shrink-0 transition-colors",
+                          isForecastMode ? "bg-white/10 text-white" : "bg-blue-50 text-blue-600"
+                        )}>
+                          <TrendingUp className="w-6 h-6" />
+                        </div>
+                        <div className="space-y-1">
+                          <h4 className="text-base font-bold">Моделирование сценариев</h4>
+                          <p className={cn("text-sm leading-relaxed", isForecastMode ? "text-blue-100" : "text-slate-500")}>
+                            Оцените влияние изменения комиссий, стоимости логистики или COGS на итоговую прибыль.
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="pt-2">
+                      <button
+                        onClick={() => setIsForecastMode(!isForecastMode)}
+                        className={cn(
+                          "w-full sm:w-auto px-5 py-2.5 text-sm font-bold rounded-xl transition-all shadow-sm flex items-center justify-center gap-2",
+                          isForecastMode 
+                            ? "bg-white text-blue-600 hover:bg-blue-50" 
+                            : "bg-slate-900 text-white hover:bg-slate-800"
+                        )}
+                      >
+                        <span>{isForecastMode ? "Отключить моделирование" : "Включить моделирование"}</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
 
-                {/* Missing SKU Warnings alert */}
+                {/* Simulation Mode Detailed Panel */}
+                <AnimatePresence>
+                  {isForecastMode && (
+                    <motion.div
+                      initial={{ height: 0, opacity: 0, scale: 0.98 }}
+                      animate={{ height: "auto", opacity: 1, scale: 1 }}
+                      exit={{ height: 0, opacity: 0, scale: 0.98 }}
+                      transition={{ duration: 0.3, ease: "easeOut" }}
+                      className="overflow-hidden"
+                    >
+                      <div className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-blue-100/80 p-6 sm:p-8 space-y-8 relative overflow-hidden">
+                        <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-400 via-indigo-400 to-violet-400" />
+                        
+                        <div className="flex items-center justify-between">
+                          <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+                            Настройка параметров
+                            <span className="px-2 py-0.5 bg-blue-50 text-blue-600 text-xs font-bold rounded-full">Прогноз активен</span>
+                          </h3>
+                        </div>
+
+                        <div className="grid gap-8 md:grid-cols-3">
+                          {/* Commission Slider */}
+                          <div className="space-y-4">
+                            <div className="flex items-center justify-between">
+                              <label className="text-sm font-bold text-slate-700">Комиссия Ozon</label>
+                              <div className="flex items-center gap-1.5">
+                                {commissionRate !== null && Math.abs(commissionRate - actualCommissionRate) > 0.05 && (
+                                  <span className={cn(
+                                    "text-xs font-bold px-1.5 py-0.5 rounded-md",
+                                    commissionRate > actualCommissionRate ? "bg-rose-50 text-rose-600" : "bg-emerald-50 text-emerald-600"
+                                  )}>
+                                    {commissionRate > actualCommissionRate ? "+" : ""}{(commissionRate - actualCommissionRate).toFixed(1)}%
+                                  </span>
+                                )}
+                                <span className="text-sm font-extrabold text-slate-900 bg-slate-100 px-2 py-1 rounded-lg">
+                                  {(commissionRate ?? actualCommissionRate).toFixed(1)}%
+                                </span>
+                              </div>
+                            </div>
+                            <input
+                              type="range"
+                              min={Math.max(0, Math.floor(actualCommissionRate - 15))}
+                              max={Math.ceil(actualCommissionRate + 20)}
+                              step="0.1"
+                              value={commissionRate ?? actualCommissionRate}
+                              onChange={(e) => setCommissionRate(parseFloat(e.target.value))}
+                              className="w-full h-2 bg-slate-200 rounded-full appearance-none cursor-pointer accent-blue-600"
+                            />
+                            <div className="flex justify-between text-xs font-semibold text-slate-400">
+                              <span>{Math.max(0, Math.floor(actualCommissionRate - 15))}%</span>
+                              <span>Факт: {actualCommissionRate.toFixed(1)}%</span>
+                              <span>{Math.ceil(actualCommissionRate + 20)}%</span>
+                            </div>
+                          </div>
+
+                          {/* Logistics Slider */}
+                          <div className="space-y-4">
+                            <div className="flex items-center justify-between">
+                              <label className="text-sm font-bold text-slate-700">Логистика</label>
+                              <div className="flex items-center gap-1.5">
+                                {logisticsRate !== null && Math.abs(logisticsRate - actualLogisticsRate) > 0.05 && (
+                                  <span className={cn(
+                                    "text-xs font-bold px-1.5 py-0.5 rounded-md",
+                                    logisticsRate > actualLogisticsRate ? "bg-rose-50 text-rose-600" : "bg-emerald-50 text-emerald-600"
+                                  )}>
+                                    {logisticsRate > actualLogisticsRate ? "+" : ""}{(logisticsRate - actualLogisticsRate).toFixed(1)}%
+                                  </span>
+                                )}
+                                <span className="text-sm font-extrabold text-slate-900 bg-slate-100 px-2 py-1 rounded-lg">
+                                  {(logisticsRate ?? actualLogisticsRate).toFixed(1)}%
+                                </span>
+                              </div>
+                            </div>
+                            <input
+                              type="range"
+                              min={Math.max(0, Math.floor(actualLogisticsRate - 15))}
+                              max={Math.ceil(actualLogisticsRate + 20)}
+                              step="0.1"
+                              value={logisticsRate ?? actualLogisticsRate}
+                              onChange={(e) => setLogisticsRate(parseFloat(e.target.value))}
+                              className="w-full h-2 bg-slate-200 rounded-full appearance-none cursor-pointer accent-blue-600"
+                            />
+                            <div className="flex justify-between text-xs font-semibold text-slate-400">
+                              <span>{Math.max(0, Math.floor(actualLogisticsRate - 15))}%</span>
+                              <span>Факт: {actualLogisticsRate.toFixed(1)}%</span>
+                              <span>{Math.ceil(actualLogisticsRate + 20)}%</span>
+                            </div>
+                          </div>
+
+                          {/* COGS Slider */}
+                          <div className="space-y-4">
+                            <div className="flex items-center justify-between">
+                              <label className="text-sm font-bold text-slate-700">Себестоимость</label>
+                              <div className="flex items-center gap-1.5">
+                                {cogsRate !== null && Math.abs(cogsRate - actualCogsRate) > 0.05 && (
+                                  <span className={cn(
+                                    "text-xs font-bold px-1.5 py-0.5 rounded-md",
+                                    cogsRate > actualCogsRate ? "bg-rose-50 text-rose-600" : "bg-emerald-50 text-emerald-600"
+                                  )}>
+                                    {cogsRate > actualCogsRate ? "+" : ""}{(cogsRate - actualCogsRate).toFixed(1)}%
+                                  </span>
+                                )}
+                                <span className="text-sm font-extrabold text-slate-900 bg-slate-100 px-2 py-1 rounded-lg">
+                                  {(cogsRate ?? actualCogsRate).toFixed(1)}%
+                                </span>
+                              </div>
+                            </div>
+                            <input
+                              type="range"
+                              min={actualCogsRate > 0 ? Math.max(0, Math.floor(actualCogsRate - 15)) : 0}
+                              max={actualCogsRate > 0 ? Math.ceil(actualCogsRate + 20) : 50}
+                              step="0.1"
+                              value={cogsRate ?? actualCogsRate}
+                              onChange={(e) => setCogsRate(parseFloat(e.target.value))}
+                              className="w-full h-2 bg-slate-200 rounded-full appearance-none cursor-pointer accent-blue-600"
+                            />
+                            <div className="flex justify-between text-xs font-semibold text-slate-400">
+                              <span>{actualCogsRate > 0 ? Math.max(0, Math.floor(actualCogsRate - 15)) : 0}%</span>
+                              <span>Факт: {actualCogsRate.toFixed(1)}%</span>
+                              <span>{actualCogsRate > 0 ? Math.ceil(actualCogsRate + 20) : 50}%</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Quick Scenarios */}
+                        <div className="pt-6 border-t border-slate-100 flex flex-wrap items-center gap-3">
+                          <span className="text-sm font-bold text-slate-900 mr-2">Сценарии:</span>
+                          <button
+                            onClick={() => {
+                              setCommissionRate(actualCommissionRate + 5);
+                              setLogisticsRate(actualLogisticsRate + 5);
+                              setCogsRate(actualCogsRate + 5);
+                            }}
+                            className="px-4 py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 text-sm font-semibold rounded-xl transition-colors truncate"
+                            title="Худший сценарий (+5% ко всему)"
+                          >
+                            Худший сценарий (+5%)
+                          </button>
+                          <button
+                            onClick={() => {
+                              setCommissionRate(actualCommissionRate + 3);
+                              setLogisticsRate(actualLogisticsRate + 3);
+                            }}
+                            className="px-4 py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 text-sm font-semibold rounded-xl transition-colors truncate"
+                            title="Рост тарифов Ozon (+3%)"
+                          >
+                            Рост тарифов (+3%)
+                          </button>
+                          <button
+                            onClick={() => {
+                              setCommissionRate(actualCommissionRate);
+                              setLogisticsRate(actualLogisticsRate);
+                              setCogsRate(actualCogsRate);
+                            }}
+                            className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-sm font-semibold rounded-xl transition-colors ml-auto"
+                          >
+                            Сбросить факт
+                          </button>
+                        </div>
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+
+                {/* Missing SKU Warnings */}
                 {Object.keys(missingCogsSkus).length > 0 && (
-                  <motion.div
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    className="p-5 bg-amber-50 border border-amber-200/80 rounded-2xl space-y-3 shadow-xs"
-                  >
-                    <div className="flex items-start gap-3">
-                      <div className="p-2 bg-amber-100 text-amber-800 rounded-lg">
-                        <AlertTriangle className="w-5 h-5" />
+                  <div className="p-6 bg-amber-50/50 border border-amber-200/60 rounded-3xl space-y-4 shadow-sm">
+                    <div className="flex items-start gap-4">
+                      <div className="p-3 bg-amber-100 text-amber-600 rounded-2xl shrink-0">
+                        <AlertTriangle className="w-6 h-6" />
                       </div>
                       <div className="space-y-1">
-                        <h4 className="text-sm font-extrabold text-amber-950">
-                          Обнаружены артикулы с отсутствующей себестоимостью
+                        <h4 className="text-base font-bold text-amber-900">
+                          Внимание: найдены артикулы без себестоимости ({Object.keys(missingCogsSkus).length} шт.)
                         </h4>
-                        <p className="text-xs text-amber-800/85 font-medium">
-                          В отчете Ozon найдены продажи/возвраты для {Object.keys(missingCogsSkus).length} артикулов, которые отсутствуют в базе себестоимости. Для расчетов их себестоимость принята равной 0. Добавьте их в ваш CSV-файл себестоимости.
+                        <p className="text-sm text-amber-800/80 leading-relaxed max-w-3xl">
+                          В отчете есть продажи для товаров, которых нет в вашей базе себестоимости. Для расчетов их себестоимость принята за 0. Рекомендуется обновить CSV/Excel базу.
                         </p>
                       </div>
                     </div>
-
-                    <div className="bg-white/80 border border-amber-200/50 rounded-xl p-3.5 max-h-[160px] overflow-y-auto divide-y divide-slate-100/80 scrollbar-thin scrollbar-thumb-amber-200">
-                      {Object.entries(missingCogsSkus).map(([sku, data]) => (
-                        <div key={sku} className="py-2 first:pt-0 last:pb-0 flex items-center justify-between text-xs">
-                          <span className="font-semibold text-slate-700 bg-slate-100 px-1.5 py-0.5 rounded font-mono">
-                            Артикул: {sku}
-                          </span>
-                          <span className="font-medium text-slate-500">
-                            Количество в операциях: <strong className="text-slate-800">{data.qty} шт.</strong>
-                          </span>
-                        </div>
+                    <div className="flex flex-wrap gap-2">
+                      {Object.entries(missingCogsSkus).slice(0, 10).map(([sku, data]) => (
+                        <span key={sku} className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-amber-200/60 rounded-lg text-sm font-medium text-slate-700">
+                          <span className="font-mono text-slate-600">{sku}</span>
+                          <span className="text-amber-600 font-bold bg-amber-50 px-1.5 rounded">{data.qty} шт.</span>
+                        </span>
                       ))}
+                      {Object.keys(missingCogsSkus).length > 10 && (
+                        <span className="inline-flex items-center px-3 py-1.5 bg-transparent text-sm font-medium text-amber-700">
+                          + еще {Object.keys(missingCogsSkus).length - 10} артикулов
+                        </span>
+                      )}
                     </div>
-                  </motion.div>
-                )}
-
-                {/* Period Banner for small screens if not in header */}
-                {result.period && (
-                  <div className="lg:hidden p-3 bg-blue-50/50 rounded-xl border border-blue-100/60 text-center text-xs font-semibold text-blue-700">
-                    {result.period}
                   </div>
                 )}
 
                 {/* Summary Metrics Section - Row 1 (Ozon Cash Flow) */}
-                <div className="space-y-4">
-                  <h3 className="text-xs font-extrabold text-slate-400 uppercase tracking-widest pl-1">
-                    Финансовый поток Ozon
-                  </h3>
+                <div className="space-y-6 pt-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">Финансовый поток Ozon</h3>
+                  </div>
                   <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4">
                     <SummaryCard
-                      title="Поступило денег (Приход)"
-                      value={result.totalInflow}
-                      description="Все зачисления по операциям продаж, скидок и программ партнёров"
-                      icon={<TrendingUp className="w-6 h-6 text-emerald-600" />}
-                      bgClassName="bg-emerald-50/40"
-                      borderClassName="border-emerald-100/80"
-                      textClassName="text-emerald-900"
+                      title="Поступило денег"
+                      value={adjustedTotalInflow}
+                      originalValue={actualTotalInflow}
+                      isForecastActive={isForecastMode}
+                      icon={<TrendingUp className="w-6 h-6 text-emerald-500" />}
                     />
                     <SummaryCard
-                      title="Списано (Расход / Услуги)"
-                      value={result.totalOutflow}
-                      description="Комиссии Ozon, логистика, реклама, возвраты и штрафы"
-                      icon={<TrendingDown className="w-6 h-6 text-rose-600" />}
-                      bgClassName="bg-rose-50/40"
-                      borderClassName="border-rose-100/80"
-                      textClassName="text-rose-900"
-                      subCaption={
-                        <span className="text-rose-700/80 text-[10px] font-extrabold bg-rose-100/40 px-2 py-0.5 rounded-md">
-                          {result.totalInflow ? (Math.abs(result.totalOutflow) / result.totalInflow * 100).toFixed(2) : "0.00"}% от прихода
-                        </span>
-                      }
+                      title="Списано (Услуги)"
+                      value={adjustedTotalOutflow}
+                      originalValue={actualTotalOutflow}
+                      isForecastActive={isForecastMode}
+                      icon={<TrendingDown className="w-6 h-6 text-rose-500" />}
+                      subText={adjustedTotalInflow ? `${(Math.abs(adjustedTotalOutflow) / adjustedTotalInflow * 100).toFixed(1)}% от прихода` : undefined}
                     />
                     <SummaryCard
-                      title="Итоговый баланс (На выплату)"
-                      value={result.netResult}
-                      description="Чистая сумма к выплате за период после всех удержаний"
-                      icon={<Coins className="w-6 h-6 text-blue-600" />}
-                      bgClassName="bg-blue-50/40"
-                      borderClassName="border-blue-100/80"
-                      textClassName="text-blue-900"
+                      title="К выплате"
+                      value={adjustedNetResultFromFlows}
+                      originalValue={actualNetResult}
+                      isForecastActive={isForecastMode}
+                      icon={<Coins className="w-6 h-6 text-blue-500" />}
                       highlight
                     />
                     <SummaryCard
-                      title="Маржинальность Ozon"
-                      value={result.totalInflow ? (result.netResult / result.totalInflow) * 100 : 0}
-                      description="Доля чистой выплаты от общей суммы прихода"
-                      icon={<Percent className="w-6 h-6 text-indigo-600" />}
-                      bgClassName="bg-indigo-50/40"
-                      borderClassName="border-indigo-100/80"
-                      textClassName="text-indigo-900"
+                      title="Маржинальность"
+                      value={adjustedTotalInflow ? (adjustedNetResultFromFlows / adjustedTotalInflow) * 100 : 0}
+                      originalValue={actualOzonMargin}
+                      isForecastActive={isForecastMode}
+                      icon={<Percent className="w-6 h-6 text-indigo-500" />}
                       isPercent
                     />
                   </div>
                 </div>
 
                 {/* Summary Metrics Section - Row 2 (Real Economy) */}
-                <div className="space-y-4">
-                  <h3 className="text-xs font-extrabold text-slate-400 uppercase tracking-widest pl-1">
-                    Реальная экономика (с себестоимостью и налогом)
-                  </h3>
+                <div className="space-y-6 pt-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">Реальная экономика</h3>
+                  </div>
                   <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4">
                     <SummaryCard
-                      title="Себестоимость производства"
+                      title="Себестоимость"
                       value={totalProductionCogs}
-                      description="Расчет по проданным товарам (Выручка) минус возвращенные (Возвраты)"
-                      icon={<ReceiptText className="w-6 h-6 text-amber-600" />}
-                      bgClassName="bg-amber-50/40"
-                      borderClassName="border-amber-100/80"
-                      textClassName="text-amber-900"
-                      subCaption={
-                        result?.totalInflow ? (
-                          <span className="text-amber-700/80 text-[10px] font-extrabold bg-amber-100/40 px-2 py-0.5 rounded-md">
-                            {(totalProductionCogs / result.totalInflow * 100).toFixed(2)}% от прихода
-                          </span>
-                        ) : undefined
-                      }
+                      originalValue={actualProductionCogs}
+                      isForecastActive={isForecastMode}
+                      inverseDifference
+                      icon={<ReceiptText className="w-6 h-6 text-amber-500" />}
+                      subText={adjustedTotalInflow ? `${(totalProductionCogs / adjustedTotalInflow * 100).toFixed(1)}% от прихода` : undefined}
                     />
                     <SummaryCard
-                      title="Налог на прибыль (ОСНО 25%)"
+                      title="Налог (ОСНО 25%)"
                       value={taxAmount}
-                      description="Рассчитан по ставке 25% на прибыль от продаж за вычетом себестоимости"
-                      icon={<FileDown className="w-6 h-6 text-rose-600" />}
-                      bgClassName="bg-rose-50/40"
-                      borderClassName="border-rose-100/80"
-                      textClassName="text-rose-900"
-                      subCaption={
-                        result && taxableProfit > 0 ? (
-                          <span className="text-rose-700/80 text-[10px] font-extrabold bg-rose-100/40 px-2 py-0.5 rounded-md">
-                            {(taxAmount / result.totalInflow * 100).toFixed(2)}% от прихода
-                          </span>
-                        ) : (
-                          <span className="text-slate-500 text-[10px] font-semibold bg-slate-100/80 px-2 py-0.5 rounded-md">
-                            Нет прибыли для налога
-                          </span>
-                        )
-                      }
+                      originalValue={actualTaxAmount}
+                      isForecastActive={isForecastMode}
+                      inverseDifference
+                      icon={<FileDown className="w-6 h-6 text-orange-500" />}
+                      subText={taxableProfit > 0 ? `${(taxAmount / adjustedTotalInflow * 100).toFixed(1)}% от прихода` : "Нет прибыли"}
                     />
                     <SummaryCard
-                      title="Реальная чистая прибыль"
+                      title="Чистая прибыль"
                       value={adjustedNetResult}
-                      description="Итоговый чистый результат после вычета себестоимости, всех комиссий и налога 25%"
-                      icon={<Coins className="w-6 h-6 text-violet-600" />}
-                      bgClassName="bg-violet-50/40"
-                      borderClassName="border-violet-100/80"
-                      textClassName="text-violet-900"
+                      originalValue={actualRealNetResult}
+                      isForecastActive={isForecastMode}
+                      icon={<Coins className="w-6 h-6 text-violet-500" />}
                       highlight
                     />
                     <SummaryCard
-                      title="Итоговая маржинальность"
+                      title="Итоговая маржа"
                       value={adjustedMargin}
-                      description="Отношение реальной чистой прибыли (после налогов) к общему приходу"
-                      icon={<Percent className="w-6 h-6 text-fuchsia-600" />}
-                      bgClassName="bg-fuchsia-50/40"
-                      borderClassName="border-fuchsia-100/80"
-                      textClassName="text-fuchsia-900"
+                      originalValue={actualRealMargin}
+                      isForecastActive={isForecastMode}
+                      icon={<Percent className="w-6 h-6 text-fuchsia-500" />}
                       isPercent
                     />
                   </div>
@@ -710,47 +1041,38 @@ export default function AccrualsPage() {
 
                 {/* Product Categories Breakdown */}
                 {activeCategories.length > 0 && (
-                  <div className="bg-white rounded-2xl shadow-sm border border-slate-200/80 p-6 space-y-4">
-                    <div className="space-y-1">
-                      <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2">
-                        <ReceiptText className="w-5 h-5 text-slate-600" />
-                        Анализ продаж по категориям товаров
-                      </h3>
-                      <p className="text-xs text-slate-500">
-                        Объемы продаж, возвратов и чистой реализации в штуках по типам товаров
-                      </p>
-                    </div>
-
+                  <div className="space-y-6 pt-4">
+                    <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">Продажи по категориям</h3>
                     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
                       {activeCategories.map((cat) => {
                         const pctOfTotal = totalNetItems > 0 ? (cat.net / totalNetItems) * 100 : 0;
                         return (
-                          <div key={cat.name} className="border border-slate-100 rounded-xl p-4 bg-slate-50/30 flex flex-col justify-between space-y-3">
+                          <div key={cat.name} className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200/60 p-6 flex flex-col justify-between space-y-5 hover:-translate-y-1 transition-all duration-300">
                             <div>
-                              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block">
-                                {cat.name}
-                              </span>
-                              <div className="text-2xl font-extrabold text-slate-800 mt-1">
-                                {cat.net} шт.
+                              <span className="text-sm font-bold text-slate-500">{cat.name}</span>
+                              <div className="text-2xl sm:text-3xl font-extrabold text-slate-900 mt-2 tracking-tight truncate" title={`${cat.net} шт.`}>
+                                {cat.net} <span className="text-base font-bold text-slate-400">шт.</span>
                               </div>
                             </div>
                             
-                            <div className="space-y-1.5 text-xs text-slate-600 font-medium">
-                              <div className="flex justify-between text-[11px]">
-                                <span>Продано:</span>
-                                <span className="font-semibold text-slate-800">{cat.sold} шт.</span>
+                            <div className="space-y-2 text-sm">
+                              <div className="flex justify-between items-center">
+                                <span className="text-slate-500">Продано:</span>
+                                <span className="font-bold text-slate-900">{cat.sold}</span>
                               </div>
-                              <div className="flex justify-between text-[11px]">
-                                <span>Возвраты:</span>
-                                <span className="font-semibold text-rose-600">{cat.returned} шт.</span>
+                              <div className="flex justify-between items-center">
+                                <span className="text-slate-500">Возвраты:</span>
+                                <span className="font-bold text-rose-500">{cat.returned}</span>
                               </div>
-                              <div className="flex justify-between text-[11px] border-t border-slate-100 pt-1">
-                                <span>Выручка:</span>
-                                <span className="font-semibold text-emerald-700">{formatCurrency(cat.revenue)}</span>
+                              <div className="flex justify-between items-center pt-2 border-t border-slate-100">
+                                <span className="text-slate-500">Выручка:</span>
+                                <span className="font-bold text-emerald-600" title={formatCurrency(cat.revenue)}>
+                                  {formatCurrency(cat.revenue, true)}
+                                </span>
                               </div>
                             </div>
 
-                            <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                            <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
                               <div
                                 className="h-full bg-blue-500 rounded-full"
                                 style={{ width: `${Math.min(100, Math.max(0, pctOfTotal))}%` }}
@@ -764,81 +1086,71 @@ export default function AccrualsPage() {
                 )}
 
                 {/* Main breakdown section */}
-                <div className="bg-white rounded-2xl shadow-sm border border-slate-200/80 overflow-hidden">
-                  <div className="p-6 border-b border-slate-100 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-                    <div className="space-y-1">
-                      <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2">
-                        <ArrowRightLeft className="w-5 h-5 text-slate-600" />
-                        Детализация по операциям
+                <div className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200/60 overflow-hidden mt-8">
+                  <div className="p-6 sm:p-8 border-b border-slate-100 flex flex-col xl:flex-row xl:items-center justify-between gap-6">
+                    <div className="space-y-2">
+                      <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">
+                        Детализация операций
                       </h3>
-                      <p className="text-xs text-slate-500">
-                        {groupingMode === "extended" 
-                          ? "Группировка по услугам Ozon и типам начислений" 
-                          : "Суженная группировка по основным категориям услуг"}
+                      <p className="text-sm text-slate-500 max-w-xl">
+                        Подробная расшифровка всех поступлений и списаний. Переключайтесь между режимами просмотра для удобства.
                       </p>
                     </div>
 
-                    <div className="flex flex-wrap items-center gap-3">
+                    <div className="flex flex-wrap items-center gap-4">
                       {/* Grouping toggles */}
-                      <div className="flex items-center p-0.5 rounded-full bg-slate-100/85 border border-slate-200/50 self-start">
+                      <div className="flex items-center p-1 rounded-xl bg-slate-100/80">
                         <button
                           onClick={() => setGroupingMode("narrow")}
                           className={cn(
-                            "px-3 py-1.5 text-[11px] font-bold rounded-full transition-all",
+                            "px-4 py-2 text-sm font-bold rounded-lg transition-all",
                             groupingMode === "narrow"
-                              ? "bg-white text-blue-600 shadow-sm"
-                              : "text-slate-500 hover:text-slate-800"
+                              ? "bg-white text-slate-900 shadow-sm"
+                              : "text-slate-500 hover:text-slate-900"
                           )}
-                          title="Агрегировать суммы только по категориям"
                         >
-                          По группам
+                          Группы
                         </button>
                         <button
                           onClick={() => setGroupingMode("hierarchical")}
                           className={cn(
-                            "px-3 py-1.5 text-[11px] font-bold rounded-full transition-all",
+                            "px-4 py-2 text-sm font-bold rounded-lg transition-all",
                             groupingMode === "hierarchical"
-                              ? "bg-white text-blue-600 shadow-sm"
-                              : "text-slate-500 hover:text-slate-800"
+                              ? "bg-white text-slate-900 shadow-sm"
+                              : "text-slate-500 hover:text-slate-900"
                           )}
-                          title="Древовидная структура с вложенными под-операциями"
                         >
                           Иерархия
                         </button>
                         <button
                           onClick={() => setGroupingMode("extended")}
                           className={cn(
-                            "px-3 py-1.5 text-[11px] font-bold rounded-full transition-all",
+                            "px-4 py-2 text-sm font-bold rounded-lg transition-all",
                             groupingMode === "extended"
-                              ? "bg-white text-blue-600 shadow-sm"
-                              : "text-slate-500 hover:text-slate-800"
-                          )}
-                          title="Плоский список всех операций по убыванию сумм"
-                        >
-                          Детально
-                        </button>
-                      </div>
-
-                      {/* Filter controls */}
-                      <div className="flex items-center p-0.5 rounded-full bg-slate-100/85 border border-slate-200/50 self-start">
-                        <button
-                          onClick={() => setActiveFilter("all")}
-                          className={cn(
-                            "px-4 py-1.5 text-xs font-semibold rounded-full transition-all",
-                            activeFilter === "all"
                               ? "bg-white text-slate-900 shadow-sm"
-                              : "text-slate-600 hover:text-slate-900"
+                              : "text-slate-500 hover:text-slate-900"
                           )}
                         >
                           Все операции
                         </button>
+                      </div>
+
+                      {/* Filter controls */}
+                      <div className="flex items-center p-1 rounded-xl bg-slate-100/80">
+                        <button
+                          onClick={() => setActiveFilter("all")}
+                          className={cn(
+                            "px-4 py-2 text-sm font-bold rounded-lg transition-all",
+                            activeFilter === "all" ? "bg-white text-slate-900 shadow-sm" : "text-slate-500 hover:text-slate-900"
+                          )}
+                        >
+                          Все
+                        </button>
                         <button
                           onClick={() => setActiveFilter("inflow")}
                           className={cn(
-                            "px-4 py-1.5 text-xs font-semibold rounded-full transition-all",
-                            activeFilter === "inflow"
-                              ? "bg-white text-emerald-700 shadow-sm"
-                              : "text-slate-600 hover:text-emerald-600"
+                            "px-4 py-2 text-sm font-bold rounded-lg transition-all",
+                            activeFilter === "inflow" ? "bg-emerald-500 text-white shadow-sm" : "text-slate-500 hover:text-emerald-600"
                           )}
                         >
                           Приходы
@@ -846,10 +1158,8 @@ export default function AccrualsPage() {
                         <button
                           onClick={() => setActiveFilter("outflow")}
                           className={cn(
-                            "px-4 py-1.5 text-xs font-semibold rounded-full transition-all",
-                            activeFilter === "outflow"
-                              ? "bg-white text-rose-700 shadow-sm"
-                              : "text-slate-600 hover:text-rose-600"
+                            "px-4 py-2 text-sm font-bold rounded-lg transition-all",
+                            activeFilter === "outflow" ? "bg-rose-500 text-white shadow-sm" : "text-slate-500 hover:text-rose-600"
                           )}
                         >
                           Списания
@@ -858,16 +1168,16 @@ export default function AccrualsPage() {
                     </div>
                   </div>
 
-                  <div className="divide-y divide-slate-100 overflow-x-auto">
-                    <table className="w-full text-left border-collapse min-w-[650px]">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left border-collapse min-w-[800px]">
                       <thead>
-                        <tr className="bg-slate-50/70 text-slate-500 font-semibold text-xs border-b border-slate-100">
-                          <th className="px-6 py-3.5 w-1/3">Операция / Группа</th>
-                          <th className="px-6 py-3.5 text-right w-[150px]">Сумма</th>
-                          <th className="px-6 py-3.5 w-[300px]">Доля во входящем/исходящем потоке</th>
+                        <tr className="bg-slate-50/50 text-slate-500 font-bold text-sm border-b border-slate-100">
+                          <th className="px-8 py-5 w-2/5">Операция</th>
+                          <th className="px-8 py-5 text-right w-1/5">Сумма</th>
+                          <th className="px-8 py-5 w-2/5">Структура потока</th>
                         </tr>
                       </thead>
-                      <tbody>
+                      <tbody className="divide-y divide-slate-100">
                         {groupingMode === "hierarchical" ? (
                           filteredHierarchical.length > 0 ? (
                             filteredHierarchical.map((groupItem) => (
@@ -880,8 +1190,8 @@ export default function AccrualsPage() {
                             ))
                           ) : (
                             <tr>
-                              <td colSpan={3} className="px-6 py-12 text-center text-slate-400 text-sm">
-                                Нет подходящих операций для отображения
+                              <td colSpan={3} className="px-8 py-16 text-center text-slate-400 text-base font-medium">
+                                Нет данных для отображения
                               </td>
                             </tr>
                           )
@@ -897,8 +1207,8 @@ export default function AccrualsPage() {
                           ))
                         ) : (
                           <tr>
-                            <td colSpan={3} className="px-6 py-12 text-center text-slate-400 text-sm">
-                              Нет подходящих операций для отображения
+                            <td colSpan={3} className="px-8 py-16 text-center text-slate-400 text-base font-medium">
+                              Нет данных для отображения
                             </td>
                           </tr>
                         )}
@@ -918,59 +1228,85 @@ export default function AccrualsPage() {
 function SummaryCard({
   title,
   value,
-  description,
   icon,
-  bgClassName,
-  borderClassName,
-  textClassName,
   highlight = false,
   isPercent = false,
-  subCaption
+  subText,
+  originalValue,
+  isForecastActive = false,
+  inverseDifference = false
 }: {
   title: string;
   value: number;
-  description: string;
   icon: React.ReactNode;
-  bgClassName: string;
-  borderClassName: string;
-  textClassName: string;
   highlight?: boolean;
   isPercent?: boolean;
-  subCaption?: React.ReactNode;
+  subText?: string;
+  originalValue?: number;
+  isForecastActive?: boolean;
+  inverseDifference?: boolean;
 }) {
+  let diffElement = null;
+  if (isForecastActive && originalValue !== undefined && Math.abs(originalValue - value) > 0.01) {
+    const diff = value - originalValue;
+    
+    const isWorse = inverseDifference ? diff > 0 : diff < 0;
+    const isBetter = inverseDifference ? diff < 0 : diff > 0;
+    
+    const diffColor = isWorse 
+      ? "text-rose-600 bg-rose-50" 
+      : isBetter 
+        ? "text-emerald-600 bg-emerald-50" 
+        : "text-slate-600 bg-slate-100";
+
+    const formattedDiff = isPercent 
+      ? `${diff > 0 ? "+" : ""}${diff.toFixed(2)}%`
+      : `${diff > 0 ? "+" : ""}${formatCurrency(diff, true)}`;
+
+    diffElement = (
+      <span className={cn("text-xs font-bold px-2 py-1 rounded-lg truncate max-w-[120px]", diffColor)} title={isPercent ? formattedDiff : `${diff > 0 ? "+" : ""}${formatCurrency(diff)}`}>
+        {formattedDiff}
+      </span>
+    );
+  }
+
   return (
     <div
       className={cn(
-        "relative p-6 rounded-2xl border bg-white shadow-sm overflow-hidden flex flex-col justify-between min-h-[160px] group transition-all duration-300 hover:shadow-md",
-        borderClassName,
-        highlight && "ring-2 ring-blue-500/10 ring-offset-1"
+        "relative p-6 sm:p-8 rounded-3xl border bg-white flex flex-col justify-between min-h-[200px] transition-all duration-300 hover:-translate-y-1 hover:shadow-lg",
+        highlight ? "border-blue-200/80 shadow-[0_8px_30px_rgb(59,130,246,0.1)] ring-1 ring-blue-500/10" : "border-slate-200/60 shadow-[0_8px_30px_rgb(0,0,0,0.04)]"
       )}
     >
-      <div className={cn("absolute inset-0 opacity-40 transition-opacity group-hover:opacity-60", bgClassName)} />
-      
-      <div className="relative z-10 flex items-start justify-between">
-        <div className="space-y-1">
-          <span className="text-xs font-semibold uppercase tracking-wider text-slate-500">
-            {title}
-          </span>
-          <p className="text-xs text-slate-500 font-medium max-w-[200px]">
-            {description}
-          </p>
-        </div>
-        <div className="p-2 bg-white rounded-xl shadow-sm border border-slate-100">
+      <div className="flex items-start justify-between">
+        <h4 className="text-sm font-bold text-slate-500 uppercase tracking-wider">{title}</h4>
+        <div className="p-3 bg-slate-50 rounded-2xl shrink-0">
           {icon}
         </div>
       </div>
 
-      <div className="relative z-10 mt-4 flex flex-col justify-end">
-        <span className={cn("text-2xl md:text-3xl font-extrabold tracking-tight block leading-none", textClassName)}>
-          {isPercent ? `${value.toFixed(2)}%` : formatCurrency(value)}
-        </span>
-        <div className="h-5 mt-2 flex items-center">
-          {subCaption ? (
-            subCaption
-          ) : (
-            <span className="text-xs text-transparent select-none">-</span>
+      <div className="mt-6 flex flex-col gap-3 min-w-0">
+        <div 
+          className="text-2xl sm:text-3xl font-extrabold text-slate-900 tracking-tight truncate"
+          title={isPercent ? `${value.toFixed(2)}%` : formatCurrency(value)}
+        >
+          {isPercent ? `${value.toFixed(2)}%` : formatCurrency(value, true)}
+        </div>
+        
+        <div className="flex flex-col gap-1.5 min-h-[28px] justify-center">
+          {diffElement && (
+            <div className="flex items-center flex-wrap gap-2">
+              {diffElement}
+              {isForecastActive && (
+                <span className="text-xs font-semibold text-slate-400 line-through truncate" title={isPercent ? `${originalValue?.toFixed(2)}%` : formatCurrency(originalValue || 0)}>
+                  {isPercent ? `${originalValue?.toFixed(2)}%` : formatCurrency(originalValue || 0, true)}
+                </span>
+              )}
+            </div>
+          )}
+          {subText && (
+            <span className="text-sm font-semibold text-slate-400 truncate" title={subText}>
+              {subText}
+            </span>
           )}
         </div>
       </div>
@@ -992,39 +1328,39 @@ function HierarchicalGroupSection({
   return (
     <>
       {/* Parent Group Row */}
-      <tr className="bg-slate-50/50 font-bold border-b border-slate-100 hover:bg-slate-100/40 transition-colors">
-        <td className="px-6 py-4">
-          <div className="text-sm font-extrabold text-slate-900 uppercase tracking-wider">
+      <tr className="bg-slate-50/30 font-bold border-b border-slate-100 hover:bg-slate-50 transition-colors">
+        <td className="px-8 py-5">
+          <div className="text-base font-extrabold text-slate-900 tracking-tight">
             {groupItem.group}
           </div>
         </td>
-        <td className="px-6 py-4 text-right">
-          <span className={cn("text-sm font-extrabold tracking-tight", isGroupInflow ? "text-emerald-700" : "text-rose-700")}>
+        <td className="px-8 py-5 text-right">
+          <span className={cn("text-base font-extrabold tracking-tight", isGroupInflow ? "text-emerald-600" : "text-rose-600")}>
             {isGroupInflow ? "+" : ""}
             {formatCurrency(groupItem.amount)}
           </span>
         </td>
-        <td className="px-6 py-4">
-          <div className="flex flex-col gap-1.5 w-full justify-center">
+        <td className="px-8 py-5">
+          <div className="flex flex-col gap-2 w-full justify-center">
             {isGroupInflow ? (
               <>
-                <div className="flex items-center justify-between text-[10px] font-bold text-slate-700">
-                  <span>{groupItem.pctOfInflow.toFixed(2)}% от прихода</span>
+                <div className="flex items-center justify-between text-xs font-bold text-slate-500">
+                  <span>{groupItem.pctOfInflow.toFixed(1)}% от прихода</span>
                 </div>
-                <div className="w-full h-2 bg-slate-200/80 rounded-full overflow-hidden">
+                <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden">
                   <div
-                     className="h-full bg-emerald-600 rounded-full"
+                     className="h-full bg-emerald-500 rounded-full"
                      style={{ width: `${Math.min(100, groupItem.pctOfInflow)}%` }}
                   />
                 </div>
               </>
             ) : (
               <>
-                <div className="flex items-center justify-between text-[10px] font-bold text-slate-700 leading-none">
-                  <span>{groupItem.pctOfOutflow.toFixed(2)}% от списаний</span>
-                  <span className="text-rose-600">{groupItem.pctOfTotalInflowForOutflow.toFixed(2)}% от выручки</span>
+                <div className="flex items-center justify-between text-xs font-bold text-slate-500">
+                  <span>{groupItem.pctOfOutflow.toFixed(1)}% от списаний</span>
+                  <span className="text-rose-500">{groupItem.pctOfTotalInflowForOutflow.toFixed(1)}% от выручки</span>
                 </div>
-                <div className="w-full h-2 bg-slate-200/80 rounded-full overflow-hidden">
+                <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden">
                   <div
                     className="h-full bg-rose-500 rounded-full"
                     style={{ width: `${Math.min(100, groupItem.pctOfOutflow)}%` }}
@@ -1040,28 +1376,28 @@ function HierarchicalGroupSection({
       {groupItem.children.map((child: any) => {
         const isChildInflow = child.amount > 0;
         return (
-          <tr key={child.type} className="hover:bg-slate-50/20 transition-colors border-b border-slate-100/50">
-            <td className="px-6 py-3 pl-12 relative">
-              <div className="absolute left-7 top-0 bottom-0 w-px bg-slate-200" />
-              <div className="absolute left-7 top-1/2 w-3.5 h-px bg-slate-200" />
-              <span className="text-xs font-semibold text-slate-600 pl-2">
+          <tr key={child.type} className="hover:bg-slate-50/50 transition-colors border-b border-slate-100/50">
+            <td className="px-8 py-4 pl-14 relative">
+              <div className="absolute left-9 top-0 bottom-0 w-px bg-slate-200" />
+              <div className="absolute left-9 top-1/2 w-4 h-px bg-slate-200" />
+              <span className="text-sm font-semibold text-slate-600">
                 {child.type}
               </span>
             </td>
-            <td className="px-6 py-3 text-right">
-              <span className={cn("text-xs font-bold", isChildInflow ? "text-emerald-600" : "text-rose-600")}>
+            <td className="px-8 py-4 text-right">
+              <span className={cn("text-sm font-bold", isChildInflow ? "text-emerald-600" : "text-rose-600")}>
                 {isChildInflow ? "+" : ""}
                 {formatCurrency(child.amount)}
               </span>
             </td>
-            <td className="px-6 py-3">
-              <div className="flex flex-col gap-1 w-full justify-center">
+            <td className="px-8 py-4">
+              <div className="flex flex-col gap-1.5 w-full justify-center">
                 {isChildInflow ? (
                   <>
-                    <div className="flex items-center justify-between text-[10px] font-medium text-slate-500">
-                      <span>{child.pctOfInflow.toFixed(2)}% от прихода</span>
+                    <div className="flex items-center justify-between text-[11px] font-semibold text-slate-400">
+                      <span>{child.pctOfInflow.toFixed(1)}% от прихода</span>
                     </div>
-                    <div className="w-full h-1 bg-slate-100 rounded-full overflow-hidden">
+                    <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
                       <div
                         className="h-full bg-emerald-400 rounded-full"
                         style={{ width: `${Math.min(100, child.pctOfInflow)}%` }}
@@ -1070,11 +1406,11 @@ function HierarchicalGroupSection({
                   </>
                 ) : (
                   <>
-                    <div className="flex items-center justify-between text-[9px] font-medium text-slate-500 leading-none">
-                      <span>{child.pctOfOutflow.toFixed(2)}% от списаний</span>
-                      <span className="text-rose-500/80">{child.pctOfTotalInflowForOutflow.toFixed(2)}% от выручки</span>
+                    <div className="flex items-center justify-between text-[11px] font-semibold text-slate-400">
+                      <span>{child.pctOfOutflow.toFixed(1)}% от списаний</span>
+                      <span className="text-rose-400">{child.pctOfTotalInflowForOutflow.toFixed(1)}% от выручки</span>
                     </div>
-                    <div className="w-full h-1 bg-slate-100 rounded-full overflow-hidden">
+                    <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
                       <div
                         className="h-full bg-rose-400 rounded-full"
                         style={{ width: `${Math.min(100, child.pctOfOutflow)}%` }}
@@ -1106,28 +1442,28 @@ function BreakdownRow({
   
   return (
     <tr className="hover:bg-slate-50/50 transition-colors group">
-      <td className="px-6 py-4">
-        <div className="space-y-0.5">
+      <td className="px-8 py-5">
+        <div className="space-y-1">
           {groupingMode === "extended" ? (
             <>
-              <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">
                 {item.group}
               </span>
-              <div className="text-sm font-semibold text-slate-800 group-hover:text-slate-900 transition-colors">
+              <div className="text-base font-bold text-slate-900">
                 {item.type}
               </div>
             </>
           ) : (
-            <div className="text-sm font-bold text-slate-800 group-hover:text-slate-900 transition-colors uppercase tracking-wider">
+            <div className="text-base font-bold text-slate-900 tracking-tight">
               {item.group}
             </div>
           )}
         </div>
       </td>
-      <td className="px-6 py-4 text-right">
+      <td className="px-8 py-5 text-right">
         <span
           className={cn(
-            "text-sm font-bold tracking-tight",
+            "text-base font-extrabold tracking-tight",
             isInflow ? "text-emerald-600" : "text-rose-600"
           )}
         >
@@ -1135,15 +1471,14 @@ function BreakdownRow({
           {formatCurrency(item.amount)}
         </span>
       </td>
-      <td className="px-6 py-4">
-        <div className="flex flex-col gap-1.5 w-full justify-center">
+      <td className="px-8 py-5">
+        <div className="flex flex-col gap-2 w-full justify-center">
           {isInflow ? (
             <>
-              {/* Progress bar for inflow */}
-              <div className="flex items-center justify-between text-[11px] font-semibold text-slate-600">
-                <span>{item.pctOfInflow.toFixed(2)}% от прихода</span>
+              <div className="flex items-center justify-between text-xs font-bold text-slate-500">
+                <span>{item.pctOfInflow.toFixed(1)}% от прихода</span>
               </div>
-              <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+              <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden">
                 <div
                   className="h-full bg-emerald-500 rounded-full transition-all duration-500"
                   style={{ width: `${Math.min(100, item.pctOfInflow)}%` }}
@@ -1152,19 +1487,15 @@ function BreakdownRow({
             </>
           ) : (
             <>
-              {/* Progress metrics and dual bar for outflow */}
-              <div className="space-y-1">
-                <div className="flex items-center justify-between text-[10px] font-semibold text-slate-600 leading-none">
-                  <span>{item.pctOfOutflow.toFixed(2)}% от списаний</span>
-                  <span className="text-rose-600">{item.pctOfTotalInflowForOutflow.toFixed(2)}% от выручки</span>
-                </div>
-                <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden flex">
-                  {/* Total outflow percentage bar */}
-                  <div
-                    className="h-full bg-rose-400 rounded-full transition-all duration-500"
-                    style={{ width: `${Math.min(100, item.pctOfOutflow)}%` }}
-                  />
-                </div>
+              <div className="flex items-center justify-between text-xs font-bold text-slate-500">
+                <span>{item.pctOfOutflow.toFixed(1)}% от списаний</span>
+                <span className="text-rose-500">{item.pctOfTotalInflowForOutflow.toFixed(1)}% от выручки</span>
+              </div>
+              <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-rose-500 rounded-full transition-all duration-500"
+                  style={{ width: `${Math.min(100, item.pctOfOutflow)}%` }}
+                />
               </div>
             </>
           )}
@@ -1173,4 +1504,3 @@ function BreakdownRow({
     </tr>
   );
 }
-

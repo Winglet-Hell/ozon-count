@@ -47,6 +47,24 @@ const isLogistics = (group: string, type: string): boolean => {
   return keywords.some(k => g.includes(k) || t.includes(k));
 };
 
+const isVolumeDependent = (group: string, type: string): boolean => {
+  const g = group.toLowerCase();
+  const t = type.toLowerCase();
+  
+  if (g.includes("продажи") || g.includes("возвраты")) return true;
+  if (isCommission(group, type)) return true;
+  if (g.includes("эквайринг") || t.includes("эквайринг")) return true;
+  
+  if (isLogistics(group, type)) {
+    // Исключаем хранение и размещение из пропорционального масштабирования
+    if (g.includes("хранени") || t.includes("хранени") || g.includes("размещен") || t.includes("размещен") || g.includes("кросс-док") || t.includes("кросс-док")) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+};
+
 export default function AccrualsPage() {
   const [isDragActive, setIsDragActive] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -66,6 +84,7 @@ export default function AccrualsPage() {
   const [commissionRate, setCommissionRate] = useState<number | null>(null);
   const [logisticsRate, setLogisticsRate] = useState<number | null>(null);
   const [cogsRate, setCogsRate] = useState<number | null>(null);
+  const [categoryGrowth, setCategoryGrowth] = useState<Record<string, number>>({});
 
   // Auto-load default себестоимость file on mount (prefers XLSX template if available)
   useEffect(() => {
@@ -172,7 +191,16 @@ export default function AccrualsPage() {
 
   // Calculate COGS and real economy metrics (unadjusted)
   let baseProductionCogs = 0;
+  let scaledBaseProductionCogs = 0;
   const missingCogsSkus: Record<string, { qty: number }> = {};
+
+  const categoryData: Record<string, { sold: number; returned: number; revenue: number }> = {
+    "Тапочки": { sold: 0, returned: 0, revenue: 0 },
+    "Жилеты": { sold: 0, returned: 0, revenue: 0 },
+    "Рубашки": { sold: 0, returned: 0, revenue: 0 },
+    "Носки": { sold: 0, returned: 0, revenue: 0 },
+    "Прочее": { sold: 0, returned: 0, revenue: 0 }
+  };
 
   if (result && result.skuTransactions) {
     result.skuTransactions.forEach((tx) => {
@@ -182,6 +210,9 @@ export default function AccrualsPage() {
       if (isSale || isReturn) {
         const cogsRateVal = skuCogs[tx.sku] || 0;
         const qty = tx.quantity;
+        const amt = tx.amount;
+        const category = getCategoryFromArticle(tx.sku);
+        const growth = isForecastMode ? (categoryGrowth[category] ?? 1) : 1;
 
         if (cogsRateVal === 0) {
           if (!missingCogsSkus[tx.sku]) {
@@ -191,14 +222,32 @@ export default function AccrualsPage() {
         }
 
         const rowCogs = qty * cogsRateVal;
+        const scaledRowCogs = rowCogs * growth;
         if (isSale) {
           baseProductionCogs += rowCogs;
+          scaledBaseProductionCogs += scaledRowCogs;
+          categoryData[category].sold += qty;
+          categoryData[category].revenue += amt;
         } else if (isReturn) {
           baseProductionCogs -= rowCogs;
+          scaledBaseProductionCogs -= scaledRowCogs;
+          categoryData[category].returned += qty;
+          categoryData[category].revenue += amt;
         }
       }
     });
   }
+
+  const activeCategories = Object.entries(categoryData)
+    .map(([name, data]) => ({
+      name,
+      ...data,
+      net: data.sold - data.returned
+    }))
+    .filter(cat => cat.sold > 0 || cat.returned > 0)
+    .sort((a, b) => b.net - a.net);
+
+  const totalNetItems = activeCategories.reduce((sum, cat) => sum + cat.net, 0);
 
   // Calculate actual base sums for Ozon commission and logistics
   let actualCommissionSum = 0;
@@ -245,17 +294,36 @@ export default function AccrualsPage() {
   // Generate adjusted breakdown and totals
   const adjustedBreakdownItems = result ? result.breakdown.map((item) => {
     let amt = item.amount;
-    if (isForecastMode && item.amount < 0) {
-      if (isCommission(item.group, item.type)) {
-        amt = actualCommissionRate > 0 
-          ? item.amount * (targetCommissionRate / actualCommissionRate)
-          : item.amount;
-      } else if (isLogistics(item.group, item.type)) {
-        amt = actualLogisticsRate > 0 
-          ? item.amount * (targetLogisticsRate / actualLogisticsRate)
-          : item.amount;
+    
+    if (isForecastMode) {
+      // 1. Scale based on volume
+      const txs = result.skuTransactions.filter(tx => tx.group === item.group && tx.type === item.type);
+      if (txs.length > 0 && isVolumeDependent(item.group, item.type)) {
+        let skuPortion = 0;
+        let scaledSkuPortion = 0;
+        txs.forEach(tx => {
+          const cat = getCategoryFromArticle(tx.sku);
+          const growth = categoryGrowth[cat] ?? 1;
+          skuPortion += tx.amount;
+          scaledSkuPortion += tx.amount * growth;
+        });
+        amt = amt - skuPortion + scaledSkuPortion;
+      }
+
+      // 2. Apply rate adjustments (Commission, Logistics)
+      if (amt < 0) {
+        if (isCommission(item.group, item.type)) {
+          amt = actualCommissionRate > 0 
+            ? amt * (targetCommissionRate / actualCommissionRate)
+            : amt;
+        } else if (isLogistics(item.group, item.type)) {
+          amt = actualLogisticsRate > 0 
+            ? amt * (targetLogisticsRate / actualLogisticsRate)
+            : amt;
+        }
       }
     }
+    
     return {
       ...item,
       amount: amt
@@ -465,7 +533,7 @@ export default function AccrualsPage() {
 
   const totalProductionCogs = (isForecastMode && actualCogsRate === 0)
     ? (adjustedTotalInflow * (targetCogsRate / 100))
-    : baseProductionCogs * (actualCogsRate > 0 ? targetCogsRate / actualCogsRate : 1);
+    : scaledBaseProductionCogs * (actualCogsRate > 0 ? targetCogsRate / actualCogsRate : 1);
 
   const taxableProfit = adjustedTotalInflow + adjustedTotalOutflow - totalProductionCogs;
   const taxRate = 0.25; // Ставка налога на прибыль ОСНО на 2026 год составляет 25%
@@ -480,46 +548,7 @@ export default function AccrualsPage() {
   const actualRealNetResult = actualTaxableProfit - actualTaxAmount;
   const actualRealMargin = actualTotalInflow ? (actualRealNetResult / actualTotalInflow) * 100 : 0;
 
-  // Category breakdown calculations
-  const categoryData: Record<string, { sold: number; returned: number; revenue: number }> = {
-    "Тапочки": { sold: 0, returned: 0, revenue: 0 },
-    "Жилеты": { sold: 0, returned: 0, revenue: 0 },
-    "Рубашки": { sold: 0, returned: 0, revenue: 0 },
-    "Носки": { sold: 0, returned: 0, revenue: 0 },
-    "Прочее": { sold: 0, returned: 0, revenue: 0 }
-  };
 
-  if (result && result.skuTransactions) {
-    result.skuTransactions.forEach((tx) => {
-      const isSale = tx.group === "Продажи" && tx.type === "Выручка";
-      const isReturn = tx.group === "Возвраты" && tx.type === "Возврат выручки";
-
-      if (isSale || isReturn) {
-        const category = getCategoryFromArticle(tx.sku);
-        const qty = tx.quantity;
-        const amt = tx.amount;
-
-        if (isSale) {
-          categoryData[category].sold += qty;
-          categoryData[category].revenue += amt;
-        } else if (isReturn) {
-          categoryData[category].returned += qty;
-          categoryData[category].revenue += amt;
-        }
-      }
-    });
-  }
-
-  const activeCategories = Object.entries(categoryData)
-    .map(([name, data]) => ({
-      name,
-      ...data,
-      net: data.sold - data.returned
-    }))
-    .filter(cat => cat.sold > 0 || cat.returned > 0)
-    .sort((a, b) => b.net - a.net);
-
-  const totalNetItems = activeCategories.reduce((sum, cat) => sum + cat.net, 0);
 
   return (
     <main className="min-h-screen bg-slate-50/50 flex flex-col selection:bg-blue-500/20">
@@ -527,9 +556,52 @@ export default function AccrualsPage() {
         onUploadClick={handleReset}
         showUploadButton={!!result}
         period={result?.period || undefined}
-      />
+      >
+        {result && (
+          <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => document.getElementById("csv-file-upload-active")?.click()}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold rounded-lg transition-all bg-transparent text-slate-600 border border-transparent hover:bg-slate-100 hover:text-slate-900"
+              title={cogsFileName ? `Себестоимость: ${cogsFileName}` : "Загрузить себестоимость"}
+            >
+              {isCogsLoading ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : cogsFileName ? (
+                <Check className="w-3.5 h-3.5" />
+              ) : (
+                <Upload className="w-3.5 h-3.5" />
+              )}
+              <span className="hidden xl:inline">Себестоимость</span>
+            </button>
+            <input
+              id="csv-file-upload-active"
+              type="file"
+              className="hidden"
+              accept=".csv,.xlsx"
+              onChange={(e) => {
+                if (e.target.files && e.target.files[0]) {
+                  handleCogsFile(e.target.files[0]);
+                }
+              }}
+            />
 
-      <div className="flex-1 flex flex-col px-4 sm:px-6 lg:px-8 py-8 w-full max-w-7xl mx-auto">
+            <button
+              onClick={() => setIsForecastMode(!isForecastMode)}
+              className={cn(
+                "flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-bold rounded-lg transition-all",
+                isForecastMode 
+                  ? "bg-blue-50 text-blue-600 border border-blue-200" 
+                  : "bg-transparent text-slate-600 border border-transparent hover:bg-slate-100 hover:text-slate-900"
+              )}
+            >
+              <TrendingUp className="w-3.5 h-3.5" />
+              <span className="hidden xl:inline">Моделирование</span>
+            </button>
+          </div>
+        )}
+      </Header>
+
+      <div className="flex-1 flex flex-col px-4 sm:px-6 lg:px-8 py-8 w-full max-w-[1600px] mx-auto">
         <div className="w-full space-y-8 transition-all duration-500 ease-out">
           
           {!result && (
@@ -672,119 +744,31 @@ export default function AccrualsPage() {
                 transition={{ duration: 0.4, ease: "easeOut" }}
                 className="space-y-8"
               >
-                {/* Control Panel: COGS & Forecasting side-by-side on large screens */}
-                <div className="grid lg:grid-cols-2 gap-6">
-                  {/* COGS Status */}
-                  <div className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200/60 p-6 flex flex-col justify-center gap-4">
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="flex items-start gap-4">
-                        <div className={cn(
-                          "p-3 rounded-2xl shrink-0 transition-colors",
-                          cogsFileName ? "bg-emerald-50 text-emerald-600" : "bg-amber-50 text-amber-600",
-                          isCogsLoading && "animate-pulse"
-                        )}>
-                          {isCogsLoading ? (
-                            <Loader2 className="w-6 h-6 animate-spin" />
-                          ) : cogsFileName ? (
-                            <Check className="w-6 h-6" />
-                          ) : (
-                            <AlertTriangle className="w-6 h-6" />
-                          )}
-                        </div>
-                        <div className="space-y-1">
-                          <h4 className="text-base font-bold text-slate-900">
-                            {cogsFileName ? "Себестоимость загружена" : "Себестоимость не учтена"}
-                          </h4>
-                          <p className="text-sm text-slate-500 leading-relaxed">
-                            {cogsFileName 
-                              ? `Активный файл: ${cogsFileName}. Участвует ${Object.keys(skuCogs).length} артикулов.` 
-                              : "Загрузите файл с себестоимостью для расчета реальной чистой прибыли."}
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-                    <div className="pt-2">
-                      <button
-                        onClick={() => document.getElementById("csv-file-upload-active")?.click()}
-                        className="w-full sm:w-auto px-5 py-2.5 bg-white border border-slate-200 hover:border-slate-300 hover:bg-slate-50 text-slate-700 text-sm font-semibold rounded-xl shadow-sm transition-all flex items-center justify-center gap-2"
-                      >
-                        <Upload className="w-4 h-4" />
-                        Обновить базу (.csv, .xlsx)
-                      </button>
-                      <input
-                        id="csv-file-upload-active"
-                        type="file"
-                        className="hidden"
-                        accept=".csv,.xlsx"
-                        onChange={(e) => {
-                          if (e.target.files && e.target.files[0]) {
-                            handleCogsFile(e.target.files[0]);
-                          }
-                        }}
-                      />
-                    </div>
-                  </div>
 
-                  {/* Forecast Toggle Card */}
-                  <div className={cn(
-                    "rounded-3xl border p-6 flex flex-col justify-center gap-4 transition-all duration-300",
-                    isForecastMode 
-                      ? "bg-blue-600 border-blue-500 shadow-lg shadow-blue-500/20 text-white" 
-                      : "bg-white border-slate-200/60 shadow-[0_8px_30px_rgb(0,0,0,0.04)] text-slate-900"
-                  )}>
-                    <div className="flex items-start justify-between gap-4">
-                      <div className="flex items-start gap-4">
-                        <div className={cn(
-                          "p-3 rounded-2xl shrink-0 transition-colors",
-                          isForecastMode ? "bg-white/10 text-white" : "bg-blue-50 text-blue-600"
-                        )}>
-                          <TrendingUp className="w-6 h-6" />
-                        </div>
-                        <div className="space-y-1">
-                          <h4 className="text-base font-bold">Моделирование сценариев</h4>
-                          <p className={cn("text-sm leading-relaxed", isForecastMode ? "text-blue-100" : "text-slate-500")}>
-                            Оцените влияние изменения комиссий, стоимости логистики или COGS на итоговую прибыль.
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-                    <div className="pt-2">
-                      <button
-                        onClick={() => setIsForecastMode(!isForecastMode)}
-                        className={cn(
-                          "w-full sm:w-auto px-5 py-2.5 text-sm font-bold rounded-xl transition-all shadow-sm flex items-center justify-center gap-2",
-                          isForecastMode 
-                            ? "bg-white text-blue-600 hover:bg-blue-50" 
-                            : "bg-slate-900 text-white hover:bg-slate-800"
-                        )}
-                      >
-                        <span>{isForecastMode ? "Отключить моделирование" : "Включить моделирование"}</span>
-                      </button>
-                    </div>
-                  </div>
-                </div>
 
-                {/* Simulation Mode Detailed Panel */}
-                <AnimatePresence>
-                  {isForecastMode && (
-                    <motion.div
-                      initial={{ height: 0, opacity: 0, scale: 0.98 }}
-                      animate={{ height: "auto", opacity: 1, scale: 1 }}
-                      exit={{ height: 0, opacity: 0, scale: 0.98 }}
-                      transition={{ duration: 0.3, ease: "easeOut" }}
-                      className="overflow-hidden"
-                    >
-                      <div className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-blue-100/80 p-6 sm:p-8 space-y-8 relative overflow-hidden">
-                        <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-blue-400 via-indigo-400 to-violet-400" />
-                        
+                {/* Main Content Layout: side-by-side on xl screens */}
+                <div className="flex flex-col xl:flex-row-reverse items-start gap-8 w-full">
+                  
+                  {/* RIGHT SIDE: Settings Sidebar */}
+                  <AnimatePresence>
+                    {isForecastMode && (
+                      <motion.div
+                        initial={{ opacity: 0, x: 20, width: 0 }}
+                        animate={{ opacity: 1, x: 0, width: "auto" }}
+                        exit={{ opacity: 0, x: 20, width: 0 }}
+                        transition={{ duration: 0.4, ease: "easeOut" }}
+                        className="w-full xl:w-[420px] shrink-0 xl:sticky xl:top-24 xl:z-20"
+                      >
+                        <div className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-blue-100/80 p-6 sm:p-8 space-y-8 relative w-full xl:w-[420px] xl:max-h-[calc(100vh-8rem)] overflow-y-auto overflow-x-hidden
+                          [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:bg-slate-200 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-slate-300">
+
                         <div className="flex items-center justify-between">
                           <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
                             Настройка параметров
-                            <span className="px-2 py-0.5 bg-blue-50 text-blue-600 text-xs font-bold rounded-full">Прогноз активен</span>
                           </h3>
                         </div>
 
-                        <div className="grid gap-8 md:grid-cols-3">
+                        <div className="space-y-6">
                           {/* Commission Slider */}
                           <div className="space-y-4">
                             <div className="flex items-center justify-between">
@@ -888,39 +872,65 @@ export default function AccrualsPage() {
                           </div>
                         </div>
 
-                        {/* Quick Scenarios */}
-                        <div className="pt-6 border-t border-slate-100 flex flex-wrap items-center gap-3">
-                          <span className="text-sm font-bold text-slate-900 mr-2">Сценарии:</span>
-                          <button
-                            onClick={() => {
-                              setCommissionRate(actualCommissionRate + 5);
-                              setLogisticsRate(actualLogisticsRate + 5);
-                              setCogsRate(actualCogsRate + 5);
-                            }}
-                            className="px-4 py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 text-sm font-semibold rounded-xl transition-colors truncate"
-                            title="Худший сценарий (+5% ко всему)"
-                          >
-                            Худший сценарий (+5%)
-                          </button>
-                          <button
-                            onClick={() => {
-                              setCommissionRate(actualCommissionRate + 3);
-                              setLogisticsRate(actualLogisticsRate + 3);
-                            }}
-                            className="px-4 py-2 bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 text-sm font-semibold rounded-xl transition-colors truncate"
-                            title="Рост тарифов Ozon (+3%)"
-                          >
-                            Рост тарифов (+3%)
-                          </button>
+                        {/* Categories Growth */}
+                        {activeCategories.length > 0 && (
+                          <div className="pt-8 mt-6 border-t border-blue-100/50">
+                            <h4 className="text-sm font-bold text-slate-900 mb-6">Рост продаж по категориям</h4>
+                            <div className="space-y-4">
+                              {activeCategories.map(cat => {
+                                const currentGrowth = categoryGrowth[cat.name] ?? 1;
+                                const pctChange = Math.round((currentGrowth - 1) * 100);
+                                return (
+                                  <div key={cat.name} className="space-y-4 bg-slate-50/50 p-4 rounded-2xl border border-slate-100">
+                                    <div className="flex items-center justify-between">
+                                      <div className="flex items-center gap-2">
+                                        <label className="text-sm font-bold text-slate-700">{cat.name}</label>
+                                        <span className="text-xs font-semibold text-slate-400">
+                                          ({Math.round(cat.net * currentGrowth)} шт.)
+                                        </span>
+                                      </div>
+                                      <div className="flex items-center gap-1.5">
+                                        <span className={cn(
+                                          "text-xs font-bold px-1.5 py-0.5 rounded-md",
+                                          pctChange > 0 ? "bg-emerald-50 text-emerald-600" : pctChange < 0 ? "bg-rose-50 text-rose-600" : "bg-slate-100 text-slate-500"
+                                        )}>
+                                          {pctChange > 0 ? "+" : ""}{pctChange}%
+                                        </span>
+                                      </div>
+                                    </div>
+                                    <input
+                                      type="range"
+                                      min="0"
+                                      max="4"
+                                      step="0.05"
+                                      value={currentGrowth}
+                                      onChange={(e) => setCategoryGrowth(prev => ({ ...prev, [cat.name]: parseFloat(e.target.value) }))}
+                                      className="w-full h-2 bg-slate-200 rounded-full appearance-none cursor-pointer accent-blue-600"
+                                    />
+                                    <div className="flex justify-between text-xs font-semibold text-slate-400">
+                                      <span>-100%</span>
+                                      <span>Факт</span>
+                                      <span>+300%</span>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Reset Settings */}
+                        <div className="pt-6 border-t border-slate-100 mt-auto">
                           <button
                             onClick={() => {
                               setCommissionRate(actualCommissionRate);
                               setLogisticsRate(actualLogisticsRate);
                               setCogsRate(actualCogsRate);
+                              setCategoryGrowth({});
                             }}
-                            className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-sm font-semibold rounded-xl transition-colors ml-auto"
+                            className="w-full px-4 py-3 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-bold rounded-xl transition-colors flex justify-center items-center gap-2"
                           >
-                            Сбросить факт
+                            Сбросить все настройки
                           </button>
                         </div>
                       </div>
@@ -928,7 +938,10 @@ export default function AccrualsPage() {
                   )}
                 </AnimatePresence>
 
-                {/* Missing SKU Warnings */}
+                {/* LEFT SIDE: Metrics and Tables */}
+                <div className="flex-1 w-full space-y-8 min-w-0">
+
+                  {/* Missing SKU Warnings */}
                 {Object.keys(missingCogsSkus).length > 0 && (
                   <div className="p-6 bg-amber-50/50 border border-amber-200/60 rounded-3xl space-y-4 shadow-sm">
                     <div className="flex items-start gap-4">
@@ -961,11 +974,11 @@ export default function AccrualsPage() {
                 )}
 
                 {/* Summary Metrics Section - Row 1 (Ozon Cash Flow) */}
-                <div className="space-y-6 pt-4">
+                <div className="space-y-6">
                   <div className="flex items-center justify-between">
                     <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">Финансовый поток Ozon</h3>
                   </div>
-                  <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4">
+                  <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
                     <SummaryCard
                       title="Поступило денег"
                       value={adjustedTotalInflow}
@@ -1005,7 +1018,7 @@ export default function AccrualsPage() {
                   <div className="flex items-center justify-between">
                     <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">Реальная экономика</h3>
                   </div>
-                  <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4">
+                  <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
                     <SummaryCard
                       title="Себестоимость"
                       value={totalProductionCogs}
@@ -1047,31 +1060,41 @@ export default function AccrualsPage() {
                 {activeCategories.length > 0 && (
                   <div className="space-y-6 pt-4">
                     <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">Продажи по категориям</h3>
-                    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+                    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5">
                       {activeCategories.map((cat) => {
-                        const pctOfTotal = totalNetItems > 0 ? (cat.net / totalNetItems) * 100 : 0;
+                        const currentGrowth = isForecastMode ? (categoryGrowth[cat.name] ?? 1) : 1;
+                        const displayNet = Math.round(cat.net * currentGrowth);
+                        const displaySold = Math.round(cat.sold * currentGrowth);
+                        const displayReturned = Math.round(cat.returned * currentGrowth);
+                        const displayRevenue = cat.revenue * currentGrowth;
+                        
+                        const adjustedTotalNetItems = isForecastMode 
+                          ? activeCategories.reduce((acc, c) => acc + c.net * (categoryGrowth[c.name] ?? 1), 0) 
+                          : totalNetItems;
+                        const pctOfTotal = adjustedTotalNetItems > 0 ? (displayNet / adjustedTotalNetItems) * 100 : 0;
+
                         return (
                           <div key={cat.name} className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200/60 p-6 flex flex-col justify-between space-y-5 hover:-translate-y-1 transition-all duration-300">
                             <div>
                               <span className="text-sm font-bold text-slate-500">{cat.name}</span>
-                              <div className="text-2xl sm:text-3xl font-extrabold text-slate-900 mt-2 tracking-tight truncate" title={`${cat.net} шт.`}>
-                                {cat.net} <span className="text-base font-bold text-slate-400">шт.</span>
+                              <div className="text-2xl sm:text-3xl font-extrabold text-slate-900 mt-2 tracking-tight truncate" title={`${displayNet} шт.`}>
+                                {displayNet} <span className="text-base font-bold text-slate-400">шт.</span>
                               </div>
                             </div>
                             
                             <div className="space-y-2 text-sm">
                               <div className="flex justify-between items-center">
                                 <span className="text-slate-500">Продано:</span>
-                                <span className="font-bold text-slate-900">{cat.sold}</span>
+                                <span className="font-bold text-slate-900">{displaySold}</span>
                               </div>
                               <div className="flex justify-between items-center">
                                 <span className="text-slate-500">Возвраты:</span>
-                                <span className="font-bold text-rose-500">{cat.returned}</span>
+                                <span className="font-bold text-rose-500">{displayReturned}</span>
                               </div>
                               <div className="flex justify-between items-center pt-2 border-t border-slate-100">
                                 <span className="text-slate-500">Выручка:</span>
-                                <span className="font-bold text-emerald-600" title={formatCurrency(cat.revenue)}>
-                                  {formatCurrency(cat.revenue, true)}
+                                <span className="font-bold text-emerald-600" title={formatCurrency(displayRevenue)}>
+                                  {formatCurrency(displayRevenue, true)}
                                 </span>
                               </div>
                             </div>
@@ -1220,7 +1243,9 @@ export default function AccrualsPage() {
                     </table>
                   </div>
                 </div>
-              </motion.div>
+              </div>
+            </div>
+          </motion.div>
             )}
           </AnimatePresence>
         </div>

@@ -11,9 +11,10 @@ interface HeaderProps {
     period?: string;
     activeTab?: "dashboard" | "articles";
     onTabChange?: (tab: "dashboard" | "articles") => void;
+    children?: React.ReactNode;
 }
 
-export function Header({ onUploadClick, showUploadButton, period, activeTab, onTabChange }: HeaderProps) {
+export function Header({ onUploadClick, showUploadButton, period, activeTab, onTabChange, children }: HeaderProps) {
     const pathname = usePathname();
 
     return (
@@ -29,39 +30,13 @@ export function Header({ onUploadClick, showUploadButton, period, activeTab, onT
                             Ozon Count
                         </h1>
                         {period && (
-                            <span className="text-xs text-slate-500 font-medium hidden lg:inline bg-slate-100 px-2 py-1 rounded-md">
-                                {period}
+                            <span className="text-xs text-slate-400 font-medium hidden lg:inline px-2 py-1">
+                                {period.replace('Период: ', '')}
                             </span>
                         )}
                     </div>
 
-                    {/* Global Page Switcher */}
-                    <nav className="flex items-center gap-1 ml-6 bg-slate-100/50 p-1 rounded-full border border-slate-200/30">
-                        <Link
-                            href="/"
-                            className={cn(
-                                "flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-full transition-all",
-                                pathname === "/"
-                                    ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-900/5"
-                                    : "text-slate-500 hover:text-slate-900 hover:bg-slate-200/30"
-                            )}
-                        >
-                            <TrendingUp className="w-3.5 h-3.5" />
-                            Unit Economics
-                        </Link>
-                        <Link
-                            href="/accruals"
-                            className={cn(
-                                "flex items-center gap-1.5 px-3 py-1 text-xs font-medium rounded-full transition-all",
-                                pathname === "/accruals"
-                                    ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-900/5"
-                                    : "text-slate-500 hover:text-slate-900 hover:bg-slate-200/30"
-                            )}
-                        >
-                            <ReceiptText className="w-3.5 h-3.5" />
-                            Accruals Report
-                        </Link>
-                    </nav>
+
                 </div>
 
                 {/* Center Navigation Tabs for Unit Economics pages (if activeTab is set) */}
@@ -96,15 +71,18 @@ export function Header({ onUploadClick, showUploadButton, period, activeTab, onT
                     </div>
                 )}
 
-                {showUploadButton && onUploadClick && (
-                    <button
-                        onClick={onUploadClick}
-                        className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-600 bg-transparent border border-slate-200 hover:bg-slate-50 hover:text-slate-900 hover:border-slate-300 rounded-lg transition-all"
-                    >
-                        <Upload className="w-4 h-4" />
-                        <span>Upload new report</span>
-                    </button>
-                )}
+                <div className="flex items-center gap-1.5 ml-auto">
+                    {children}
+                    {showUploadButton && onUploadClick && (
+                        <button
+                            onClick={onUploadClick}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-slate-600 bg-transparent border border-transparent hover:bg-slate-100 hover:text-slate-900 rounded-lg transition-all"
+                        >
+                            <Upload className="w-3.5 h-3.5" />
+                            Загрузить отчет
+                        </button>
+                    )}
+                </div>
             </div>
         </header>
     );

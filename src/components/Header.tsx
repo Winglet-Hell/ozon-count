@@ -9,8 +9,8 @@ interface HeaderProps {
     onUploadClick?: () => void;
     showUploadButton?: boolean;
     period?: string;
-    activeTab?: "dashboard" | "articles";
-    onTabChange?: (tab: "dashboard" | "articles") => void;
+    activeTab?: "dashboard" | "articles" | "repricer" | "accruals" | string;
+    onTabChange?: (tab: "dashboard" | "articles" | string) => void;
     children?: React.ReactNode;
 }
 
@@ -39,37 +39,34 @@ export function Header({ onUploadClick, showUploadButton, period, activeTab, onT
 
                 </div>
 
-                {/* Center Navigation Tabs for Unit Economics pages (if activeTab is set) */}
-                {showUploadButton && activeTab && onTabChange && (
-                    <div className="flex-1 hidden md:flex items-center justify-center">
-                        <div className="flex items-center p-1 rounded-full bg-slate-100/50 border border-slate-200/50">
-                            <button
-                                onClick={() => onTabChange("dashboard")}
-                                className={cn(
-                                    "flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-full transition-all duration-200",
-                                    activeTab === "dashboard"
-                                        ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-900/5"
-                                        : "text-slate-500 hover:text-slate-900 hover:bg-slate-200/50"
-                                )}
-                            >
-                                <LayoutGrid className="w-4 h-4" />
-                                Dashboard
-                            </button>
-                            <button
-                                onClick={() => onTabChange("articles")}
-                                className={cn(
-                                    "flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-full transition-all duration-200",
-                                    activeTab === "articles"
-                                        ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-900/5"
-                                        : "text-slate-500 hover:text-slate-900 hover:bg-slate-200/50"
-                                )}
-                            >
-                                <TableIcon className="w-4 h-4" />
-                                Articles
-                            </button>
-                        </div>
+                <div className="flex-1 hidden md:flex items-center justify-center">
+                    <div className="flex items-center p-1 rounded-full bg-slate-100/50 border border-slate-200/50">
+                        <Link
+                            href="/accruals"
+                            className={cn(
+                                "flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-full transition-all duration-200",
+                                (!activeTab || activeTab === "dashboard" || activeTab === "articles" || activeTab === "accruals")
+                                    ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-900/5"
+                                    : "text-slate-500 hover:text-slate-900 hover:bg-slate-200/50"
+                            )}
+                        >
+                            <LayoutGrid className="w-4 h-4" />
+                            Начисления
+                        </Link>
+                        <Link
+                            href="/repricer"
+                            className={cn(
+                                "flex items-center gap-2 px-4 py-1.5 text-sm font-medium rounded-full transition-all duration-200",
+                                activeTab === "repricer"
+                                    ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-900/5"
+                                    : "text-slate-500 hover:text-slate-900 hover:bg-slate-200/50"
+                            )}
+                        >
+                            <TableIcon className="w-4 h-4" />
+                            Репрайсер
+                        </Link>
                     </div>
-                )}
+                </div>
 
                 <div className="flex items-center gap-1.5 ml-auto">
                     {children}

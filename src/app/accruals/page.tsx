@@ -7,6 +7,8 @@ import { Header } from "@/components/Header";
 import { parseAccrualsReport, parseCogsCsv, parseCogsXlsx, type AccrualsSummary, type AccrualsBreakdownItem } from "@/lib/parseAccruals";
 import { cn } from "@/lib/utils";
 
+import { useAppState } from "@/components/StoreProvider";
+
 const formatCurrency = (val: number, compact: boolean = false): string => {
   if (compact && Math.abs(val) >= 1000) {
     return new Intl.NumberFormat("ru-RU", {
@@ -68,14 +70,12 @@ const isVolumeDependent = (group: string, type: string): boolean => {
 export default function AccrualsPage() {
   const [isDragActive, setIsDragActive] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [result, setResult] = useState<AccrualsSummary | null>(null);
+  const { accrualsResult: result, setAccrualsResult: setResult, skuCogs, setSkuCogs, cogsFileName, setCogsFileName } = useAppState();
   const [error, setError] = useState<string | null>(null);
   const [activeFilter, setActiveFilter] = useState<"all" | "inflow" | "outflow">("all");
   const [groupingMode, setGroupingMode] = useState<"narrow" | "extended" | "hierarchical">("extended");
 
   // Cost Database States
-  const [skuCogs, setSkuCogs] = useState<Record<string, number>>({});
-  const [cogsFileName, setCogsFileName] = useState<string | null>(null);
   const [isCogsLoading, setIsCogsLoading] = useState(false);
   const [cogsError, setCogsError] = useState<string | null>(null);
 
@@ -90,24 +90,44 @@ export default function AccrualsPage() {
   useEffect(() => {
     const fetchDefaultCogs = async () => {
       try {
+        let finalCogs: Record<string, number> = {};
+        let finalName = "";
+
         // Try XLSX template first
-        const xlsxRes = await fetch("/Шаблон для обновления цен_17.06.26 (3).xlsx");
+        const xlsxRes = await fetch("/Шаблон для обновления цен_18.06.26 (2).xlsx");
         if (xlsxRes.ok) {
           const blob = await xlsxRes.blob();
-          const file = new File([blob], "Шаблон для обновления цен_17.06.26 (3).xlsx");
-          const parsed = await parseCogsXlsx(file);
-          setSkuCogs(parsed);
-          setCogsFileName("Шаблон для обновления цен_17.06.26 (3).xlsx (авто)");
-          return;
+          const file = new File([blob], "Шаблон для обновления цен_18.06.26 (2).xlsx");
+          finalCogs = await parseCogsXlsx(file);
+          finalName = "Шаблон для обновления цен_18.06.26 (2).xlsx (авто)";
+        } else {
+          // Fallback to CSV database
+          const csvRes = await fetch("/Товары что мы продаем.csv");
+          if (csvRes.ok) {
+            const text = await csvRes.text();
+            finalCogs = parseCogsCsv(text);
+            finalName = "Товары что мы продаем.csv (авто)";
+          }
         }
 
-        // Fallback to CSV database
-        const csvRes = await fetch("/Товары что мы продаем.csv");
-        if (csvRes.ok) {
-          const text = await csvRes.text();
-          const parsed = parseCogsCsv(text);
-          setSkuCogs(parsed);
-          setCogsFileName("Товары что мы продаем.csv (авто)");
+        // Merge with archived COGS
+        try {
+          const archRes = await fetch("/archived_cogs.csv");
+          if (archRes.ok) {
+            const text = await archRes.text();
+            const archCogs = parseCogsCsv(text);
+            finalCogs = { ...finalCogs, ...archCogs };
+            if (finalName) {
+              finalName += " + Архив";
+            } else {
+              finalName = "archived_cogs.csv (авто)";
+            }
+          }
+        } catch (e) {}
+
+        if (Object.keys(finalCogs).length > 0) {
+          setSkuCogs(finalCogs);
+          setCogsFileName(finalName);
         }
       } catch (err) {
         console.error("Ошибка автозагрузки себестоимости:", err);
@@ -129,8 +149,20 @@ export default function AccrualsPage() {
       } else {
         throw new Error("Пожалуйста, загрузите себестоимость в формате CSV (.csv) или Excel (.xlsx)");
       }
+
+      // Automatically merge with archived COGS if available
+      try {
+        const archRes = await fetch("/archived_cogs.csv");
+        if (archRes.ok) {
+          const text = await archRes.text();
+          const archCogs = parseCogsCsv(text);
+          parsed = { ...parsed, ...archCogs };
+        }
+      } catch (e) {}
+
       setSkuCogs(parsed);
-      setCogsFileName(file.name);
+      setCogsFileName(file.name + " + Архив");
+
     } catch (err) {
       console.error(err);
       setCogsError(err instanceof Error ? err.message : "Ошибка загрузки себестоимости");

@@ -1,10 +1,11 @@
 "use client";
 
 import { useState, useCallback, useEffect } from "react";
-import { Upload, Loader2, Coins, TrendingUp, TrendingDown, ReceiptText, ArrowRightLeft, FileSpreadsheet, Info, Percent, AlertTriangle, Check, FileDown } from "lucide-react";
+import { Upload, Loader2, Coins, TrendingUp, TrendingDown, ReceiptText, ArrowRightLeft, FileSpreadsheet, Info, Percent, AlertTriangle, Check, FileDown, Landmark, ChevronDown } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Header } from "@/components/Header";
 import { parseAccrualsReport, parseCogsCsv, parseCogsXlsx, type AccrualsSummary, type AccrualsBreakdownItem } from "@/lib/parseAccruals";
+import { computeVat, splitFlowForVat, isVatFree, vatFraction, type VatResult } from "@/lib/vat";
 import { cn } from "@/lib/utils";
 
 import { useAppState } from "@/components/StoreProvider";
@@ -70,7 +71,14 @@ const isVolumeDependent = (group: string, type: string): boolean => {
 export default function AccrualsPage() {
   const [isDragActive, setIsDragActive] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const { accrualsResult: result, setAccrualsResult: setResult, skuCogs, setSkuCogs, cogsFileName, setCogsFileName } = useAppState();
+  const {
+    accrualsResult: result, setAccrualsResult: setResult,
+    skuCogs, setSkuCogs,
+    cogsFileName, setCogsFileName,
+    vatRate, setVatRate,
+    cogsVatShare, setCogsVatShare,
+    incomeTaxRate, setIncomeTaxRate
+  } = useAppState();
   const [error, setError] = useState<string | null>(null);
   const [activeFilter, setActiveFilter] = useState<"all" | "inflow" | "outflow">("all");
   const [groupingMode, setGroupingMode] = useState<"narrow" | "extended" | "hierarchical">("extended");
@@ -567,18 +575,123 @@ export default function AccrualsPage() {
     ? (adjustedTotalInflow * (targetCogsRate / 100))
     : scaledBaseProductionCogs * (actualCogsRate > 0 ? targetCogsRate / actualCogsRate : 1);
 
-  const taxableProfit = adjustedTotalInflow + adjustedTotalOutflow - totalProductionCogs;
-  const taxRate = 0.25; // Ставка налога на прибыль ОСНО на 2026 год составляет 25%
+  const actualProductionCogs = baseProductionCogs;
+
+  // НДС на ОСНО. Поток Ozon идет брутто, поэтому налог возникает только в расчетах
+  // с бюджетом: он уменьшает и базу налога на прибыль, и остающиеся деньги.
+  const vat = computeVat(splitFlowForVat(adjustedBreakdownItems), totalProductionCogs, vatRate, cogsVatShare);
+  const actualVat = computeVat(splitFlowForVat(result?.breakdown ?? []), actualProductionCogs, vatRate, cogsVatShare);
+
+  const taxRate = incomeTaxRate / 100;
+
+  const taxableProfit = adjustedTotalInflow + adjustedTotalOutflow - totalProductionCogs - vat.vatPayable;
   const taxAmount = Math.max(0, taxableProfit * taxRate);
   const adjustedNetResult = taxableProfit - taxAmount;
-  const adjustedMargin = adjustedTotalInflow ? (adjustedNetResult / adjustedTotalInflow) * 100 : 0;
 
   // Actual (un-adjusted) Real Economy Metrics
-  const actualProductionCogs = baseProductionCogs;
-  const actualTaxableProfit = actualNetResult - actualProductionCogs;
+  const actualTaxableProfit = actualNetResult - actualProductionCogs - actualVat.vatPayable;
   const actualTaxAmount = Math.max(0, actualTaxableProfit * taxRate);
   const actualRealNetResult = actualTaxableProfit - actualTaxAmount;
-  const actualRealMargin = actualTotalInflow ? (actualRealNetResult / actualTotalInflow) * 100 : 0;
+
+  // Единая база для всех процентов на странице — продажи с НДС, то есть та сумма,
+  // которую продавец видит приходящей. Считать доли от выручки без НДС корректнее
+  // в терминах отчетности, но тогда на одном экране получаются два разных процента
+  // для одних и тех же денег.
+  //
+  // Это именно продажи, а не карточка «Поступило денег»: та считает возвраты комиссий
+  // и отмены начислений отдельным приходом, тогда как здесь они уменьшают списания.
+  // Поэтому строки сводки и прибыль сходятся с базой ровно в 100%.
+  const isSalesGroup = (group: string) => group.toLowerCase().includes("продажи");
+  const isReturnsGroup = (group: string) => group.toLowerCase().includes("возвраты");
+
+  let salesBase = 0;
+  let ozonSpend = 0;
+  // Раздельно для цены безубыточности: возвраты и комиссия — процент от цены,
+  // остальное на единицу товара фиксировано.
+  let returnsSpend = 0;
+  let commissionSpend = 0;
+  let fixedVatable = 0;
+  let fixedVatFree = 0;
+
+  finalBreakdown.forEach((item) => {
+    if (isSalesGroup(item.group)) {
+      salesBase += item.amount;
+      return;
+    }
+    const spend = -item.amount;
+    ozonSpend += spend;
+
+    if (isReturnsGroup(item.group)) returnsSpend += spend;
+    else if (isCommission(item.group, item.type)) commissionSpend += spend;
+    else if (isVatFree(item.type)) fixedVatFree += spend;
+    else fixedVatable += spend;
+  });
+
+  const actualSalesBase = (result?.breakdown ?? []).reduce(
+    (sum, item) => (isSalesGroup(item.group) ? sum + item.amount : sum),
+    0
+  );
+
+  const pctOfSales = (value: number): string | undefined =>
+    salesBase ? `${((value / salesBase) * 100).toFixed(1)}% от продаж` : undefined;
+
+  const adjustedMargin = salesBase ? (adjustedNetResult / salesBase) * 100 : 0;
+  const actualRealMargin = actualSalesBase ? (actualRealNetResult / actualSalesBase) * 100 : 0;
+
+  // Штук нетто за период — чтобы показать каждую статью в рублях на единицу товара
+  const netUnits = activeCategories.reduce(
+    (sum, cat) => sum + cat.net * (isForecastMode ? (categoryGrowth[cat.name] ?? 1) : 1),
+    0
+  );
+
+  const moneyStructure = [
+    { label: "Списания Ozon", hint: "комиссия, логистика, реклама, возвраты", color: "bg-rose-500", amount: ozonSpend },
+    { label: "Себестоимость", hint: "производство товара", color: "bg-violet-400", amount: totalProductionCogs },
+    { label: `НДС к уплате (${vatRate}%)`, hint: "исчисленный минус вычеты", color: "bg-sky-400", amount: vat.vatPayable },
+    { label: `Налог на прибыль (${incomeTaxRate}%)`, hint: "с базы без НДС", color: "bg-blue-500", amount: taxAmount }
+  ]
+    .filter((b) => Math.abs(b.amount) > 0.005)
+    .map((b) => ({
+      ...b,
+      pct: salesBase ? (b.amount / salesBase) * 100 : 0,
+      perUnit: netUnits ? b.amount / netUnits : 0
+    }));
+
+  // Цена безубыточности за единицу.
+  //
+  // Просто сложить расходы на единицу нельзя: комиссия Ozon и возвраты — процент от цены
+  // и растут вместе с ней, а логистика, реклама и себестоимость на единицу фиксированы.
+  // Ищем множитель x к текущей цене, при котором прибыль до налога = 0:
+  //   x·(Продажи − Возвраты − Комиссия)·(1 − r) = Фиксированные − Вычет по фиксированным·r
+  const r = vatFraction(vatRate);
+  const variableMargin = salesBase - returnsSpend - commissionSpend;
+  const fixedCosts = fixedVatable + fixedVatFree + totalProductionCogs;
+  const fixedDeductible = fixedVatable + totalProductionCogs * (cogsVatShare / 100);
+
+  const currentPricePerUnit = netUnits ? salesBase / netUnits : 0;
+  const priceModelWorks = netUnits > 0 && variableMargin > 0;
+
+  // Вклад в покрытие с рубля цены и фиксированные затраты, очищенные от вычета
+  const contribution = variableMargin * (1 - r);
+  const fixedNet = fixedCosts - fixedDeductible * r;
+
+  const breakEvenPrice = priceModelWorks ? (currentPricePerUnit * fixedNet) / contribution : null;
+
+  // Цена под целевую чистую маржу: 0,75·(contribution·x − fixedNet) = margin·x·Продажи.
+  // Комиссия — процент от цены, поэтому маржа упирается в потолок 0,75·contribution/Продажи:
+  // выше него не помогает никакая цена.
+  const afterTax = 1 - taxRate;
+  const maxAchievableMargin = salesBase ? (afterTax * contribution) / salesBase * 100 : 0;
+
+  const marginPriceOptions = priceModelWorks
+    ? [5, 10, 15, 20].map((margin) => {
+        const denominator = afterTax * contribution - (margin / 100) * salesBase;
+        return {
+          margin,
+          price: denominator > 0 ? (currentPricePerUnit * afterTax * fixedNet) / denominator : null
+        };
+      })
+    : [];
 
 
 
@@ -1007,8 +1120,15 @@ export default function AccrualsPage() {
 
                 {/* Summary Metrics Section - Row 1 (Ozon Cash Flow) */}
                 <div className="space-y-6">
-                  <div className="flex items-center justify-between">
+                  <div className="space-y-2">
                     <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">Финансовый поток Ozon</h3>
+                    <p className="text-sm text-slate-500 flex items-start gap-2 max-w-3xl">
+                      <Info className="w-4 h-4 shrink-0 mt-0.5 text-slate-400" />
+                      <span>
+                        Расчеты с Ozon — суммы с НДС, как в отчете: площадка и платит выручку, и удерживает услуги брутто.
+                        НДС — это расчеты с бюджетом, он посчитан ниже, в «Реальной экономике».
+                      </span>
+                    </p>
                   </div>
                   <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
                     <SummaryCard
@@ -1050,7 +1170,7 @@ export default function AccrualsPage() {
                   <div className="flex items-center justify-between">
                     <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">Реальная экономика</h3>
                   </div>
-                  <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
+                  <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5">
                     <SummaryCard
                       title="Себестоимость"
                       value={totalProductionCogs}
@@ -1058,16 +1178,25 @@ export default function AccrualsPage() {
                       isForecastActive={isForecastMode}
                       inverseDifference
                       icon={<ReceiptText className="w-6 h-6 text-amber-500" />}
-                      subText={adjustedTotalInflow ? `${(totalProductionCogs / adjustedTotalInflow * 100).toFixed(1)}% от прихода` : undefined}
+                      subText={pctOfSales(totalProductionCogs)}
                     />
                     <SummaryCard
-                      title="Налог (ОСНО 25%)"
+                      title={vat.vatPayable < 0 ? `НДС к возмещению (${vatRate}%)` : `НДС к уплате (${vatRate}%)`}
+                      value={Math.abs(vat.vatPayable)}
+                      originalValue={Math.abs(actualVat.vatPayable)}
+                      isForecastActive={isForecastMode}
+                      inverseDifference={vat.vatPayable >= 0}
+                      icon={<Landmark className="w-6 h-6 text-sky-500" />}
+                      subText={pctOfSales(vat.vatPayable)}
+                    />
+                    <SummaryCard
+                      title={`Налог на прибыль (${incomeTaxRate}%)`}
                       value={taxAmount}
                       originalValue={actualTaxAmount}
                       isForecastActive={isForecastMode}
                       inverseDifference
                       icon={<FileDown className="w-6 h-6 text-orange-500" />}
-                      subText={taxableProfit > 0 ? `${(taxAmount / adjustedTotalInflow * 100).toFixed(1)}% от прихода` : "Нет прибыли"}
+                      subText={taxableProfit > 0 ? pctOfSales(taxAmount) : "Нет прибыли"}
                     />
                     <SummaryCard
                       title="Чистая прибыль"
@@ -1084,8 +1213,40 @@ export default function AccrualsPage() {
                       isForecastActive={isForecastMode}
                       icon={<Percent className="w-6 h-6 text-fuchsia-500" />}
                       isPercent
+                      subText="от продаж с НДС"
                     />
                   </div>
+
+                  <p className="text-sm text-slate-500 flex items-start gap-2 max-w-4xl">
+                    <Info className="w-4 h-4 shrink-0 mt-0.5 text-slate-400" />
+                    <span>
+                      Налог на прибыль посчитан за период, а не нарастающим итогом с начала года,
+                      и накопленный убыток прошлых периодов не переносится. Плюс в базе нет расходов
+                      вне Ozon — зарплаты, аренды, бухгалтерии. В прибыльном периоде налог здесь завышен.
+                    </span>
+                  </p>
+
+                  <TaxPanel
+                    vat={vat}
+                    vatRate={vatRate}
+                    onVatRateChange={setVatRate}
+                    cogsVatShare={cogsVatShare}
+                    onCogsVatShareChange={setCogsVatShare}
+                    incomeTaxRate={incomeTaxRate}
+                    onIncomeTaxRateChange={setIncomeTaxRate}
+                    incomeTaxAmount={taxAmount}
+                  />
+
+                  <MoneyStructure
+                    items={moneyStructure}
+                    base={salesBase}
+                    netProfit={adjustedNetResult}
+                    netUnits={netUnits}
+                    currentPrice={currentPricePerUnit}
+                    breakEvenPrice={breakEvenPrice}
+                    marginOptions={marginPriceOptions}
+                    maxMargin={maxAchievableMargin}
+                  />
                 </div>
 
                 {/* Product Categories Breakdown */}
@@ -1372,6 +1533,445 @@ function SummaryCard({
         </div>
       </div>
     </div>
+  );
+}
+
+/** Панель, свернутая по умолчанию: в шапке остается заголовок и главная цифра. */
+function CollapsiblePanel({
+  title,
+  subtitle,
+  summaryLabel,
+  summaryValue,
+  children
+}: {
+  title: string;
+  subtitle?: string;
+  summaryLabel: string;
+  summaryValue: string;
+  children: React.ReactNode;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+
+  return (
+    <div className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200/60 overflow-hidden">
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className="w-full flex flex-wrap items-center justify-between gap-x-6 gap-y-2 px-6 sm:px-8 py-5 text-left hover:bg-slate-50/70 transition-colors"
+      >
+        <div className="flex items-center gap-3 min-w-0">
+          <ChevronDown className={cn("w-4 h-4 text-slate-400 shrink-0 transition-transform", isOpen && "rotate-180")} />
+          <span className="text-base font-bold text-slate-900">{title}</span>
+          {subtitle && <span className="text-xs font-semibold text-slate-400 hidden sm:inline">{subtitle}</span>}
+        </div>
+        <div className="text-sm text-slate-500">
+          {summaryLabel}: <span className="font-extrabold text-slate-900 tabular-nums">{summaryValue}</span>
+        </div>
+      </button>
+
+      {isOpen && <div className="px-6 sm:px-8 pb-6 sm:pb-8 pt-6 border-t border-slate-100">{children}</div>}
+    </div>
+  );
+}
+
+function MoneyStructure({
+  items,
+  base,
+  netProfit,
+  netUnits,
+  currentPrice,
+  breakEvenPrice,
+  marginOptions,
+  maxMargin
+}: {
+  items: { label: string; hint: string; color: string; amount: number; pct: number; perUnit: number }[];
+  base: number;
+  netProfit: number;
+  netUnits: number;
+  currentPrice: number;
+  breakEvenPrice: number | null;
+  marginOptions: { margin: number; price: number | null }[];
+  maxMargin: number;
+}) {
+  const netPct = base ? (netProfit / base) * 100 : 0;
+  const isProfit = netProfit >= 0;
+  const units = Math.round(netUnits);
+  const perUnit = (value: number) => (netUnits ? value / netUnits : 0);
+
+  return (
+    <CollapsiblePanel
+      title="Куда уходят деньги"
+      subtitle={units > 0 ? `${units} шт. за период` : undefined}
+      summaryLabel={isProfit ? "Осталось" : "Убыток"}
+      summaryValue={formatCurrency(netProfit)}
+    >
+      <p className="text-sm text-slate-500 mb-6">
+        Все доли — от продаж с НДС ({formatCurrency(base)}): выручка, баллы за скидки и программы
+        партнеров. Возвраты комиссий и отмены начислений уменьшают свою статью, поэтому строки
+        и прибыль в сумме дают ровно 100%.
+        {units > 0 && ` Вторая колонка — сколько это в среднем на одну проданную единицу.`}
+      </p>
+
+      {/* Общая полоса */}
+      <div className="flex h-4 rounded-full overflow-hidden bg-emerald-100 mb-7">
+        {items.map((item) => (
+          <div
+            key={item.label}
+            className={cn(item.color, "transition-all duration-500")}
+            style={{ width: `${Math.max(0, Math.min(100, item.pct))}%` }}
+            title={`${item.label}: ${item.pct.toFixed(1)}%`}
+          />
+        ))}
+      </div>
+
+      <div className="divide-y divide-slate-100">
+        {items.map((item) => (
+          <div key={item.label} className="flex items-center gap-3 sm:gap-4 py-4">
+            <span className={cn("w-2.5 h-2.5 rounded-full shrink-0", item.color)} />
+            <div className="flex-1 min-w-0">
+              <div className="text-sm font-bold text-slate-800">{item.label}</div>
+              <div className="text-xs text-slate-400 truncate">{item.hint}</div>
+            </div>
+            <div className="shrink-0 text-right">
+              <div className="text-sm font-bold text-slate-500 tabular-nums whitespace-nowrap" title={formatCurrency(item.amount)}>
+                {formatCurrency(item.amount, true)}
+              </div>
+              {netUnits > 0 && (
+                <div
+                  className="text-xs text-slate-400 tabular-nums whitespace-nowrap"
+                  title={`${formatCurrency(item.perUnit)} на единицу товара`}
+                >
+                  {formatCurrency(item.perUnit)} / шт.
+                </div>
+              )}
+            </div>
+            <span className="text-base sm:text-lg font-extrabold text-slate-900 tabular-nums shrink-0 w-14 sm:w-16 text-right">
+              {item.pct.toFixed(1)}%
+            </span>
+          </div>
+        ))}
+
+        <div className="flex items-center gap-3 sm:gap-4 pt-4">
+          <span className={cn("w-2.5 h-2.5 rounded-full shrink-0", isProfit ? "bg-emerald-500" : "bg-rose-600")} />
+          <div className="flex-1 min-w-0">
+            <div className="text-base font-extrabold text-slate-900">
+              {isProfit ? "Осталось: чистая прибыль" : "Не хватило: убыток"}
+            </div>
+            <div className="text-xs text-slate-400 truncate">от продаж с НДС</div>
+          </div>
+          <div className="shrink-0 text-right">
+            <div
+              className={cn("text-sm font-bold tabular-nums whitespace-nowrap", isProfit ? "text-emerald-600" : "text-rose-600")}
+              title={formatCurrency(netProfit)}
+            >
+              {formatCurrency(netProfit, true)}
+            </div>
+            {netUnits > 0 && (
+              <div
+                className={cn("text-xs tabular-nums whitespace-nowrap", isProfit ? "text-emerald-500/70" : "text-rose-500/70")}
+                title={`${formatCurrency(perUnit(netProfit))} на единицу товара`}
+              >
+                {formatCurrency(perUnit(netProfit))} / шт.
+              </div>
+            )}
+          </div>
+          <span
+            className={cn("text-lg sm:text-xl font-extrabold tabular-nums shrink-0 w-14 sm:w-16 text-right", isProfit ? "text-emerald-600" : "text-rose-600")}
+          >
+            {netPct.toFixed(1)}%
+          </span>
+        </div>
+      </div>
+
+      {breakEvenPrice !== null && currentPrice > 0 && (
+        <BreakEvenPrice
+          currentPrice={currentPrice}
+          breakEvenPrice={breakEvenPrice}
+          marginOptions={marginOptions}
+          maxMargin={maxMargin}
+        />
+      )}
+    </CollapsiblePanel>
+  );
+}
+
+/** Средняя цена за единицу, при которой период выходит в ноль. */
+function BreakEvenPrice({
+  currentPrice,
+  breakEvenPrice,
+  marginOptions,
+  maxMargin
+}: {
+  currentPrice: number;
+  breakEvenPrice: number;
+  marginOptions: { margin: number; price: number | null }[];
+  maxMargin: number;
+}) {
+  const deltaPct = ((breakEvenPrice - currentPrice) / currentPrice) * 100;
+  const needsIncrease = deltaPct > 0.05;
+  const reachable = marginOptions.filter((o) => o.price !== null);
+
+  return (
+    <div className="mt-7 space-y-4">
+      <div
+        className={cn(
+          "p-5 sm:p-6 rounded-2xl border",
+          needsIncrease ? "bg-rose-50/60 border-rose-200/70" : "bg-emerald-50/60 border-emerald-200/70"
+        )}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-4">
+          <div className="min-w-0">
+            <div className="text-sm font-bold text-slate-900">
+              {needsIncrease
+                ? "Чтобы выйти в ноль, средняя цена должна быть"
+                : "Запас по цене: в ноль выходит уже при"}
+            </div>
+            <div className="text-xs text-slate-500 mt-1 leading-relaxed max-w-xl">
+              Сейчас средняя цена {formatCurrency(currentPrice)} за единицу. Просто сложить расходы
+              на единицу нельзя: комиссия Ozon и возвраты — процент от цены и растут вместе с ней,
+              а логистика, реклама и себестоимость на единицу не меняются.
+            </div>
+          </div>
+          <div className="text-right shrink-0">
+            <div className={cn("text-3xl font-extrabold tracking-tight", needsIncrease ? "text-rose-600" : "text-emerald-600")}>
+              {formatCurrency(breakEvenPrice)}
+            </div>
+            <div className={cn("text-sm font-bold mt-1", needsIncrease ? "text-rose-500" : "text-emerald-600")}>
+              {deltaPct > 0 ? "+" : ""}
+              {deltaPct.toFixed(1)}% к текущей цене
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {reachable.length > 0 && (
+        <div className="p-5 sm:p-6 rounded-2xl border border-slate-200/80 bg-slate-50/60">
+          <div className="text-sm font-bold text-slate-900 mb-1">Цена под целевую чистую прибыль</div>
+          <div className="text-xs text-slate-500 mb-5 leading-relaxed max-w-2xl">
+            Маржа — от продаж с НДС, уже после НДС и налога на прибыль. Шаги растут неравномерно:
+            комиссия Ozon — процент от цены, поэтому каждый следующий процент маржи требует все
+            большей прибавки. Потолок при нынешней комиссии и затратах — {maxMargin.toFixed(1)}%.
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {reachable.map((option) => (
+              <div
+                key={option.margin}
+                className="bg-white rounded-xl border border-slate-200/80 px-2 sm:px-4 py-4 text-center"
+              >
+                <div className="text-[11px] sm:text-xs font-bold text-slate-400 uppercase tracking-wider whitespace-nowrap">
+                  маржа {option.margin}%
+                </div>
+                <div className="text-base sm:text-xl font-extrabold text-slate-900 tracking-tight mt-2 tabular-nums whitespace-nowrap">
+                  {formatCurrency(option.price as number)}
+                </div>
+                <div className="text-xs font-bold text-slate-400 mt-1 tabular-nums">
+                  +{(((option.price as number) - currentPrice) / currentPrice * 100).toFixed(0)}%
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function VatRow({
+  label,
+  caption,
+  value,
+  sign,
+  strong = false
+}: {
+  label: string;
+  caption?: string;
+  value: number;
+  sign: "plus" | "minus" | "total";
+  strong?: boolean;
+}) {
+  const color =
+    sign === "plus" ? "text-slate-900" : sign === "minus" ? "text-emerald-600" : "text-slate-900";
+
+  return (
+    <div className={cn("flex items-baseline justify-between gap-4 py-3", strong && "pt-4")}>
+      <div className="min-w-0">
+        <div className={cn("truncate", strong ? "text-base font-extrabold text-slate-900" : "text-sm font-semibold text-slate-700")}>
+          {label}
+        </div>
+        {caption && <div className="text-xs text-slate-400 mt-0.5 truncate">{caption}</div>}
+      </div>
+      <div
+        className={cn("shrink-0 tabular-nums tracking-tight", strong ? "text-xl font-extrabold" : "text-sm font-bold", color)}
+        title={formatCurrency(value)}
+      >
+        {sign === "minus" ? "−" : ""}
+        {formatCurrency(Math.abs(value))}
+      </div>
+    </div>
+  );
+}
+
+function TaxPanel({
+  vat,
+  vatRate,
+  onVatRateChange,
+  cogsVatShare,
+  onCogsVatShareChange,
+  incomeTaxRate,
+  onIncomeTaxRateChange,
+  incomeTaxAmount
+}: {
+  vat: VatResult;
+  vatRate: number;
+  onVatRateChange: (v: number) => void;
+  cogsVatShare: number;
+  onCogsVatShareChange: (v: number) => void;
+  incomeTaxRate: number;
+  onIncomeTaxRateChange: (v: number) => void;
+  incomeTaxAmount: number;
+}) {
+  const isRefund = vat.vatPayable < 0;
+
+  return (
+    <CollapsiblePanel
+      title="Налоги"
+      subtitle={`НДС ${vatRate}%, прибыль ${incomeTaxRate}%, себестоимость с НДС ${cogsVatShare}%`}
+      summaryLabel="Всего к уплате"
+      summaryValue={formatCurrency(vat.vatPayable + incomeTaxAmount)}
+    >
+      <div className="flex flex-col xl:flex-row gap-8 xl:gap-10">
+        {/* Calculation */}
+        <div className="flex-1 min-w-0">
+          <h5 className="text-base font-bold text-slate-900 mb-1">Расчет НДС</h5>
+          <p className="text-sm text-slate-500 mb-4">
+            Управленческая оценка по дате начисления. В декларации НДС считается по отгрузке и счетам-фактурам,
+            поэтому цифры близки, но не совпадут копейка в копейку.
+          </p>
+
+          <div className="divide-y divide-slate-100">
+            <VatRow
+              label="НДС исчислен с реализации"
+              caption={`База ${formatCurrency(vat.revenueGross, true)} — выручка, баллы за скидки и программы партнеров за вычетом возвратов`}
+              value={vat.vatOutput}
+              sign="plus"
+            />
+            <VatRow
+              label="Вычет по услугам Ozon"
+              caption={`База ${formatCurrency(vat.servicesVatableGross, true)} — комиссия, логистика, реклама, эквайринг`}
+              value={vat.vatInputServices}
+              sign="minus"
+            />
+            <VatRow
+              label="Вычет по себестоимости"
+              caption={`${cogsVatShare}% себестоимости с входящим НДС`}
+              value={vat.vatInputCogs}
+              sign="minus"
+            />
+            <VatRow
+              label={isRefund ? "НДС к возмещению из бюджета" : "НДС к уплате в бюджет"}
+              caption={`Выручка без НДС — ${formatCurrency(vat.revenueNet)}`}
+              value={vat.vatPayable}
+              sign="total"
+              strong
+            />
+          </div>
+
+          {vat.servicesVatFreeGross > 0 && (
+            <p className="text-xs text-slate-400 mt-4 leading-relaxed">
+              Вне НДС: {formatCurrency(vat.servicesVatFreeGross)} — компенсации, декомпенсации и штрафы.
+              В вычет не идут, но уменьшают базу налога на прибыль.
+            </p>
+          )}
+        </div>
+
+        {/* Settings */}
+        <div className="xl:w-[360px] shrink-0 space-y-7 xl:border-l xl:border-slate-100 xl:pl-10">
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-4">
+              <label htmlFor="vat-rate" className="text-sm font-bold text-slate-700">
+                Ставка НДС
+              </label>
+              <div className="flex items-center gap-1.5 bg-slate-100 rounded-lg px-2 py-1">
+                <input
+                  id="vat-rate"
+                  type="number"
+                  min={0}
+                  max={30}
+                  step={1}
+                  value={vatRate}
+                  onChange={(e) => {
+                    const next = parseFloat(e.target.value);
+                    onVatRateChange(isNaN(next) ? 0 : Math.min(30, Math.max(0, next)));
+                  }}
+                  className="w-12 bg-transparent text-sm font-extrabold text-slate-900 text-right outline-none"
+                />
+                <span className="text-sm font-extrabold text-slate-900">%</span>
+              </div>
+            </div>
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Общая ставка с 01.01.2026 — 22%. Для детской одежды и обуви применяется 10%.
+            </p>
+          </div>
+
+          <div className="space-y-4">
+            <div className="flex items-center justify-between gap-4">
+              <label htmlFor="cogs-vat-share" className="text-sm font-bold text-slate-700">
+                Себестоимость с входящим НДС
+              </label>
+              <span className="text-sm font-extrabold text-slate-900 bg-slate-100 px-2 py-1 rounded-lg">
+                {cogsVatShare}%
+              </span>
+            </div>
+            <input
+              id="cogs-vat-share"
+              type="range"
+              min={0}
+              max={100}
+              step={1}
+              value={cogsVatShare}
+              onChange={(e) => onCogsVatShareChange(parseFloat(e.target.value))}
+              className="w-full h-2 bg-slate-200 rounded-full appearance-none cursor-pointer accent-blue-600"
+            />
+            <div className="flex justify-between text-xs font-semibold text-slate-400">
+              <span>0%</span>
+              <span>100%</span>
+            </div>
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Доля покупных материалов, сырья и услуг с НДС в себестоимости. Зарплата, страховые взносы
+              и амортизация НДС не облагаются, поэтому у собственного производства эта доля ниже 100%.
+            </p>
+          </div>
+
+          <div className="space-y-3 pt-6 border-t border-slate-100">
+            <div className="flex items-center justify-between gap-4">
+              <label htmlFor="income-tax-rate" className="text-sm font-bold text-slate-700">
+                Налог на прибыль
+              </label>
+              <div className="flex items-center gap-1.5 bg-slate-100 rounded-lg px-2 py-1">
+                <input
+                  id="income-tax-rate"
+                  type="number"
+                  min={0}
+                  max={35}
+                  step={1}
+                  value={incomeTaxRate}
+                  onChange={(e) => {
+                    const next = parseFloat(e.target.value);
+                    onIncomeTaxRateChange(isNaN(next) ? 0 : Math.min(35, Math.max(0, next)));
+                  }}
+                  className="w-12 bg-transparent text-sm font-extrabold text-slate-900 text-right outline-none"
+                />
+                <span className="text-sm font-extrabold text-slate-900">%</span>
+              </div>
+            </div>
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Общая ставка с 01.01.2025 — 25%. Из них 17 п.п. идут в региональный бюджет, и регион
+              может их понижать для отдельных категорий плательщиков.
+            </p>
+          </div>
+        </div>
+      </div>
+    </CollapsiblePanel>
   );
 }
 

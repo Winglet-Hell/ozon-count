@@ -3,6 +3,7 @@
 import { createContext, useContext, useState } from "react";
 import { AccrualsSummary } from "@/lib/parseAccruals";
 import { ParsedTemplate, RepricerItem } from "@/lib/repricer";
+import { DEFAULT_VAT_RATE, DEFAULT_COGS_VAT_SHARE, DEFAULT_INCOME_TAX_RATE } from "@/lib/vat";
 
 interface AppState {
   accrualsResult: AccrualsSummary | null;
@@ -19,6 +20,18 @@ interface AppState {
 
   cogsFileName: string | null;
   setCogsFileName: React.Dispatch<React.SetStateAction<string | null>>;
+
+  /** Ставка НДС, % */
+  vatRate: number;
+  setVatRate: React.Dispatch<React.SetStateAction<number>>;
+
+  /** Доля себестоимости с входящим НДС, % */
+  cogsVatShare: number;
+  setCogsVatShare: React.Dispatch<React.SetStateAction<number>>;
+
+  /** Ставка налога на прибыль, % */
+  incomeTaxRate: number;
+  setIncomeTaxRate: React.Dispatch<React.SetStateAction<number>>;
 }
 
 const AppStateContext = createContext<AppState | undefined>(undefined);
@@ -29,6 +42,9 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
   const [repricerItems, setRepricerItems] = useState<RepricerItem[]>([]);
   const [skuCogs, setSkuCogs] = useState<Record<string, number>>({});
   const [cogsFileName, setCogsFileName] = useState<string | null>(null);
+  const [vatRate, setVatRate] = useState<number>(DEFAULT_VAT_RATE);
+  const [cogsVatShare, setCogsVatShare] = useState<number>(DEFAULT_COGS_VAT_SHARE);
+  const [incomeTaxRate, setIncomeTaxRate] = useState<number>(DEFAULT_INCOME_TAX_RATE);
 
   return (
     <AppStateContext.Provider value={{
@@ -36,7 +52,10 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       repricerParsedData, setRepricerParsedData,
       repricerItems, setRepricerItems,
       skuCogs, setSkuCogs,
-      cogsFileName, setCogsFileName
+      cogsFileName, setCogsFileName,
+      vatRate, setVatRate,
+      cogsVatShare, setCogsVatShare,
+      incomeTaxRate, setIncomeTaxRate
     }}>
       {children}
     </AppStateContext.Provider>

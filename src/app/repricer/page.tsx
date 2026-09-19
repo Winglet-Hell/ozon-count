@@ -1,17 +1,31 @@
 "use client";
 
 import { useState, useCallback, useMemo } from "react";
-import { Upload, Loader2, FileSpreadsheet, Download, RefreshCw, AlertTriangle, Coins } from "lucide-react";
+import { Upload, Loader2, FileSpreadsheet, Download, RefreshCw, TrendingUp, Plus, Minus, AlertTriangle, Coins } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Header } from "@/components/Header";
 import { parseOzonTemplate, exportOzonTemplate, type ParsedTemplate, type RepricerItem } from "@/lib/repricer";
 import { cn } from "@/lib/utils";
 import { useAppState } from "@/components/StoreProvider";
+import { isVatFree, vatFraction } from "@/lib/vat";
+
+interface SkuMetrics {
+  pct: number; // percent-of-price costs as a share of what the seller receives
+  fixedVatable: number; // per unit sold, Ozon services with VAT
+  fixedVatFree: number; // per unit sold, compensations and fines without VAT
+  quantity: number; // units sold in the report period
+}
+
+interface UnitEconomics extends Omit<SkuMetrics, "quantity"> {
+  cogs: number;
+  quantity: number;
+}
 
 export default function RepricerPage() {
   const [isDragActive, setIsDragActive] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [bulkPct, setBulkPct] = useState("10");
   
   const { 
     repricerParsedData: parsedData, 
@@ -19,156 +33,184 @@ export default function RepricerPage() {
     repricerItems: items, 
     setRepricerItems: setItems,
     accrualsResult,
-    skuCogs
+    skuCogs,
+    vatRate,
+    cogsVatShare,
+    incomeTaxRate
   } = useAppState();
 
-  // Extract real Ozon discounts from the Accruals report if available
+  // Fallback Ozon discount from the report: share of "баллы за скидки" in what the seller receives
+  // (sales net of returns). Used only when the template has no customer price.
   const accrualsDiscountMap = useMemo(() => {
     if (!accrualsResult) return {};
-    
-    const map: Record<string, { revenue: number, compensation: number }> = {};
-    
+
+    const map: Record<string, { revenue: number; compensation: number }> = {};
     accrualsResult.skuTransactions.forEach(tx => {
-      const isRevenue = tx.group === "Продажи" && tx.type === "Выручка";
-      const isCompensation = tx.group.toLowerCase().includes("баллы за скидки") || tx.type.toLowerCase().includes("баллы за скидки");
-      
-      if (isRevenue || isCompensation) {
-        if (!map[tx.sku]) map[tx.sku] = { revenue: 0, compensation: 0 };
-        if (isRevenue) map[tx.sku].revenue += tx.amount;
-        // Compensations are usually positive in the report, but just in case we take Math.abs
-        if (isCompensation) map[tx.sku].compensation += Math.abs(tx.amount);
-      }
+      const type = tx.type.toLowerCase();
+      const isRevenue = type.includes("выручка");
+      const isCompensation = type.includes("баллы за скидки") || tx.group.toLowerCase().includes("баллы за скидки");
+      if (!isRevenue && !isCompensation) return;
+      if (!map[tx.sku]) map[tx.sku] = { revenue: 0, compensation: 0 };
+      if (isRevenue) map[tx.sku].revenue += tx.amount;
+      if (isCompensation) map[tx.sku].compensation += tx.amount;
     });
 
     const discounts: Record<string, number> = {};
     for (const [sku, data] of Object.entries(map)) {
       const total = data.revenue + data.compensation;
-      if (total > 0 && data.compensation > 0) {
-        discounts[sku] = data.compensation / total;
-      } else {
-        discounts[sku] = 0;
-      }
+      discounts[sku] = total > 0 && data.compensation > 0 ? data.compensation / total : 0;
     }
     return discounts;
   }, [accrualsResult]);
 
-  // Extract Ozon expenses per SKU, separated into variable (%) and fixed (RUB), and global fixed expenses
-  const { skuMetricsMap, globalFixedRubPerUnit, globalVariablePct, avgSkuFixedRubPerUnit } = useMemo(() => {
-    if (!accrualsResult) return { skuMetricsMap: {}, globalFixedRubPerUnit: 0, globalVariablePct: 0, avgSkuFixedRubPerUnit: 0 };
-    
-    const map: Record<string, { revenue: number; variableExpenses: number; fixedExpenses: number; salesQuantity: number }> = {};
-    
-    let totalSkuOutflow = 0;
-    let totalSkuInflow = 0;
-    let totalSalesQuantity = 0;
+  // Unit economics per SKU from the accruals report — the same model as «Реальная экономика»
+  // on the accruals page:
+  //   • percent-of-price costs — commission, acquiring, search promotion and return reversals
+  //     (revenue and points given back; refunded commission nets against them);
+  //   • fixed per unit sold — logistics, delivery, return logistics, packaging, storage and everything else;
+  //   • VAT-free lines (compensations, fines) are kept apart: they give no VAT deduction.
+  // Costs booked without an article (ads per click, cross-docking, insurance) are spread over all units sold.
+  const { skuMetricsMap, globalFixed, avgPct, avgSkuFixed } = useMemo(() => {
+    const empty = { skuMetricsMap: {} as Record<string, SkuMetrics>, globalFixed: { vatable: 0, vatFree: 0 }, avgPct: 0, avgSkuFixed: { vatable: 0, vatFree: 0 } };
+    if (!accrualsResult) return empty;
 
+    const isPercentOfPrice = (group: string, type: string) => {
+      const g = group.toLowerCase();
+      const t = type.toLowerCase();
+      return (
+        g.includes("вознаграждение") || t.includes("вознаграждение") || g.includes("комисси") || t.includes("комисси") ||
+        g.includes("эквайринг") || t.includes("эквайринг") ||
+        g.includes("продвижение в поиске") || t.includes("продвижение в поиске") ||
+        t.includes("возврат выручки") || t.includes("баллы за скидки") || g.includes("баллы за скидки")
+      );
+    };
+    const isRevenue = (group: string, type: string, amount: number) => {
+      const g = group.toLowerCase();
+      const t = type.toLowerCase();
+      return amount > 0 && (g === "продажи" || t.includes("выручка") || t.includes("баллы за скидки") || g.includes("баллы за скидки"));
+    };
+
+    const perSku: Record<string, { revenue: number; pctCost: number; fixedVatable: number; fixedVatFree: number; quantity: number }> = {};
+    // Remainder of each group::type after subtracting SKU rows = rows booked without an article
+    const globalByType: Record<string, { type: string; amount: number }> = {};
+    accrualsResult.breakdown.forEach(b => {
+      globalByType[`${b.group}::${b.type}`] = { type: b.type, amount: b.amount };
+    });
+
+    let totalSalesQuantity = 0;
     accrualsResult.skuTransactions.forEach(tx => {
-      if (!map[tx.sku]) {
-        map[tx.sku] = { revenue: 0, variableExpenses: 0, fixedExpenses: 0, salesQuantity: 0 };
-      }
-      
-      const lowerGrp = tx.group.toLowerCase();
+      const key = `${tx.group}::${tx.type}`;
+      if (globalByType[key]) globalByType[key].amount -= tx.amount;
+
+      const sku = perSku[tx.sku] || (perSku[tx.sku] = { revenue: 0, pctCost: 0, fixedVatable: 0, fixedVatFree: 0, quantity: 0 });
       const lowerType = tx.type.toLowerCase();
 
-      if (tx.amount > 0) {
-        totalSkuInflow += tx.amount;
-        if (lowerGrp === "продажи" || lowerType.includes("выручка") || lowerType.includes("баллы за скидки") || lowerGrp.includes("баллы за скидки")) {
-          map[tx.sku].revenue += tx.amount;
-        } else {
-          // Other positive compensations reduce fixed expenses
-          map[tx.sku].fixedExpenses -= tx.amount;
-        }
-      } else if (tx.amount < 0) {
-        totalSkuOutflow += tx.amount;
-        const isVariable = 
-          lowerGrp.includes("вознаграждение") ||
-          lowerType.includes("вознаграждение") ||
-          lowerGrp.includes("эквайринг") ||
-          lowerType.includes("эквайринг") ||
-          lowerType.includes("последняя миля") ||
-          lowerType.includes("доставка до места выдачи") ||
-          lowerType.includes("логистика") ||
-          lowerGrp.includes("логистика") ||
-          lowerGrp.includes("продвижение в поиске") ||
-          lowerType.includes("возврат выручки") ||
-          lowerType.includes("баллы за скидки");
-
-        if (isVariable) {
-          map[tx.sku].variableExpenses += Math.abs(tx.amount);
-        } else {
-          map[tx.sku].fixedExpenses += Math.abs(tx.amount);
-        }
+      if (isRevenue(tx.group, tx.type, tx.amount)) {
+        sku.revenue += tx.amount;
+      } else if (isPercentOfPrice(tx.group, tx.type)) {
+        sku.pctCost -= tx.amount; // refunds (positive) reduce the percent cost
+      } else if (isVatFree(tx.type)) {
+        sku.fixedVatFree -= tx.amount;
+      } else {
+        sku.fixedVatable -= tx.amount;
       }
-      
-      // Track quantity for weighted average margin ONLY from actual revenue rows to prevent double-counting compensation rows
+
+      // Units sold — only from revenue rows, so compensation rows aren't double counted
       if (tx.group === "Продажи" && tx.quantity > 0 && tx.amount > 0 && (lowerType.includes("выручка") || lowerType.includes("доставлен покупателю"))) {
-        map[tx.sku].salesQuantity += tx.quantity;
+        sku.quantity += tx.quantity;
         totalSalesQuantity += tx.quantity;
       }
     });
-    
-    let totalVar = 0;
-    let totalRev = 0;
-    let totalSkuFixed = 0;
 
-    const skuMetricsMap: Record<string, { variablePct: number; fixedRubPerUnit: number; quantity: number }> = {};
-    for (const [sku, data] of Object.entries(map)) {
+    let globalVatable = 0;
+    let globalVatFree = 0;
+    Object.values(globalByType).forEach(({ type, amount }) => {
+      if (isVatFree(type)) globalVatFree -= amount;
+      else globalVatable -= amount;
+    });
+    if (globalVatable + globalVatFree < 0) { globalVatable = 0; globalVatFree = 0; }
+    const perUnit = (value: number) => (totalSalesQuantity > 0 ? value / totalSalesQuantity : 0);
+    const globalFixed = { vatable: perUnit(globalVatable), vatFree: perUnit(globalVatFree) };
+
+    const skuMetricsMap: Record<string, SkuMetrics> = {};
+    let totalRevenue = 0;
+    let totalPctCost = 0;
+    let totalFixedVatable = 0;
+    let totalFixedVatFree = 0;
+    for (const [sku, d] of Object.entries(perSku)) {
       skuMetricsMap[sku] = {
-        variablePct: data.revenue > 0 ? (data.variableExpenses / data.revenue) : 0,
-        fixedRubPerUnit: data.salesQuantity > 0 ? (data.fixedExpenses / data.salesQuantity) : 0,
-        quantity: data.salesQuantity
+        pct: d.revenue > 0 ? d.pctCost / d.revenue : 0,
+        fixedVatable: d.quantity > 0 ? d.fixedVatable / d.quantity : 0,
+        fixedVatFree: d.quantity > 0 ? d.fixedVatFree / d.quantity : 0,
+        quantity: d.quantity
       };
-      totalVar += data.variableExpenses;
-      totalRev += data.revenue;
-      totalSkuFixed += data.fixedExpenses;
+      totalRevenue += d.revenue;
+      totalPctCost += d.pctCost;
+      totalFixedVatable += d.fixedVatable;
+      totalFixedVatFree += d.fixedVatFree;
     }
 
-    const globalOutflow = accrualsResult.totalOutflow - totalSkuOutflow; // both negative
-    const globalInflow = accrualsResult.totalInflow - totalSkuInflow;
-    const netGlobalExpenses = Math.max(0, Math.abs(globalOutflow) - globalInflow);
-    const globalFixedRubPerUnit = totalSalesQuantity > 0 ? (netGlobalExpenses / totalSalesQuantity) : 0;
-    
-    const globalVariablePct = totalRev > 0 ? (totalVar / totalRev) : 0;
-    const avgSkuFixedRubPerUnit = totalSalesQuantity > 0 ? (totalSkuFixed / totalSalesQuantity) : 0;
-
-    return { skuMetricsMap, globalFixedRubPerUnit, globalVariablePct, avgSkuFixedRubPerUnit };
+    return {
+      skuMetricsMap,
+      globalFixed,
+      avgPct: totalRevenue > 0 ? totalPctCost / totalRevenue : 0,
+      avgSkuFixed: { vatable: perUnit(totalFixedVatable), vatFree: perUnit(totalFixedVatFree) }
+    };
   }, [accrualsResult]);
 
-  // Calculate overall weighted margin and profit based on history
+  const vatFrac = vatFraction(vatRate);
+  const cogsVatFrac = cogsVatShare / 100;
+  const taxRate = incomeTaxRate / 100;
+
+  // Everything needed to price one unit of a SKU. Store averages stand in for SKUs without sales history.
+  // Null without the report or COGS — a forecast without Ozon's costs or the product cost would mislead.
+  const unitEconomics = useCallback((article: string): UnitEconomics | null => {
+    if (!accrualsResult) return null;
+    const cogs = skuCogs[article] || 0;
+    if (cogs <= 0) return null;
+    const metrics = skuMetricsMap[article];
+    const pct = metrics ? metrics.pct : avgPct;
+    if (pct >= 1) return null;
+    return {
+      pct,
+      fixedVatable: (metrics ? metrics.fixedVatable : avgSkuFixed.vatable) + globalFixed.vatable,
+      fixedVatFree: (metrics ? metrics.fixedVatFree : avgSkuFixed.vatFree) + globalFixed.vatFree,
+      cogs,
+      quantity: metrics?.quantity ?? 0
+    };
+  }, [accrualsResult, skuCogs, skuMetricsMap, avgPct, avgSkuFixed, globalFixed]);
+
+  // Net profit per unit at a given price: price − Ozon costs − COGS − VAT payable − income tax.
+  // VAT payable = VAT on the price − deductions on Ozon services with VAT and on the VAT-bearing share of COGS.
+  const profitAt = useCallback((econ: UnitEconomics, price: number) => {
+    const pctCost = price * econ.pct;
+    const services = pctCost + econ.fixedVatable + econ.fixedVatFree;
+    const vatPayable = vatFrac * (price - pctCost - econ.fixedVatable) - vatFrac * econ.cogs * cogsVatFrac;
+    const taxable = price - services - econ.cogs - vatPayable;
+    return taxable - Math.max(0, taxable * taxRate);
+  }, [vatFrac, cogsVatFrac, taxRate]);
+
+  // Break-even (0% margin): the price where pre-tax profit is zero, solved from profitAt in closed form
+  const breakEvenOf = useCallback((econ: UnitEconomics) => {
+    const numerator = econ.fixedVatable * (1 - vatFrac) + econ.fixedVatFree + econ.cogs * (1 - vatFrac * cogsVatFrac);
+    return numerator / ((1 - vatFrac) * (1 - econ.pct));
+  }, [vatFrac, cogsVatFrac]);
+
+  // Overall weighted margin: forecast profit at the planned prices over last period's volumes
   const overallMetrics = useMemo(() => {
     if (!items.length) return null;
 
     let totalRevenue = 0;
     let totalProfit = 0;
     let totalQuantity = 0;
-    const taxRate = 0.25;
 
     items.forEach(item => {
+      const econ = unitEconomics(item.article);
+      if (!econ || econ.quantity <= 0) return;
       const basePrice = item.newPrice ?? item.currentPrice;
-      const metrics = skuMetricsMap[item.article];
-      const cogs = skuCogs[item.article] || 0;
-      const qty = metrics?.quantity || 0;
-
-      if (qty > 0) {
-        let expectedProfit = 0;
-        if (metrics) {
-          const varExp = basePrice * metrics.variablePct;
-          const fixExp = metrics.fixedRubPerUnit + globalFixedRubPerUnit;
-          const taxableProfit = basePrice - varExp - fixExp - cogs;
-          const taxAmount = Math.max(0, taxableProfit * taxRate);
-          expectedProfit = taxableProfit - taxAmount;
-        } else if (cogs > 0) {
-          const varExp = basePrice * globalVariablePct;
-          const fixExp = avgSkuFixedRubPerUnit + globalFixedRubPerUnit;
-          const taxableProfit = basePrice - varExp - fixExp - cogs;
-          const taxAmount = Math.max(0, taxableProfit * taxRate);
-          expectedProfit = taxableProfit - taxAmount;
-        }
-        
-        totalRevenue += basePrice * qty;
-        totalProfit += expectedProfit * qty;
-        totalQuantity += qty;
-      }
+      totalRevenue += basePrice * econ.quantity;
+      totalProfit += profitAt(econ, basePrice) * econ.quantity;
+      totalQuantity += econ.quantity;
     });
 
     if (totalRevenue === 0 || totalQuantity === 0) return null;
@@ -179,7 +221,25 @@ export default function RepricerPage() {
       totalQuantity,
       marginPct: totalProfit / totalRevenue
     };
-  }, [items, skuMetricsMap, skuCogs, globalFixedRubPerUnit, globalVariablePct, avgSkuFixedRubPerUnit]);
+  }, [items, unitEconomics, profitAt]);
+
+  const breakEvenPrice = useCallback((article: string): number | null => {
+    const econ = unitEconomics(article);
+    return econ ? breakEvenOf(econ) : null;
+  }, [unitEconomics, breakEvenOf]);
+
+  // Promo floor ("Ограничение для акций и стратегий"): break-even, but Ozon rejects a floor below 50%
+  // of the price ("Укажите минимальную цену не меньше 50%"), and it can't exceed the price itself.
+  const minPriceFor = useCallback((item: RepricerItem) => {
+    const price = item.newPrice ?? item.currentPrice;
+    const ozonMin = Math.round(price * 0.5);
+    const breakEven = breakEvenPrice(item.article);
+    if (breakEven === null) return { value: ozonMin, breakEven, source: "fallback" as const };
+    const floor = Math.ceil(breakEven);
+    if (floor >= price) return { value: Math.round(price), breakEven, source: "capped" as const };
+    if (floor < ozonMin) return { value: ozonMin, breakEven, source: "ozonMin" as const };
+    return { value: floor, breakEven, source: "breakeven" as const };
+  }, [breakEvenPrice]);
 
   // Group items by base model to alternate background colors
   const itemsWithGroups = useMemo(() => {
@@ -267,14 +327,17 @@ export default function RepricerPage() {
     }));
   };
 
-  const handleApplyIndexGlobal = () => {
+  // onlyRaise: apply the index only where it raises the price; items the index would lower keep their current price
+  const handleApplyIndexGlobal = (onlyRaise = false) => {
+    const clamp = (item: RepricerItem, price: number) => (onlyRaise ? Math.max(item.currentPrice, price) : price);
+
     setItems(prev => {
       // Step 1: Compute adjusted prices for items that HAVE an index
       const indexedItems = prev
         .filter(item => item.priceIndex && item.priceIndex > 0)
         .map(item => ({
           ...item,
-          newPrice: Math.round(item.currentPrice / item.priceIndex!),
+          newPrice: clamp(item, Math.round(item.currentPrice / item.priceIndex!)),
           needsAttention: false,
           baseName: item.article.replace(/\d+/g, '') // strip digits for similarity matching
         }));
@@ -304,13 +367,28 @@ export default function RepricerPage() {
             }
           }
           // Borrow the calculated newPrice from the best matching sibling
-          return { ...item, newPrice: bestCandidate.newPrice, needsAttention: true };
+          return { ...item, newPrice: clamp(item, bestCandidate.newPrice!), needsAttention: true };
         }
 
         // Fallback: If no similar item is found, just use currentPrice
         return { ...item, newPrice: item.currentPrice, needsAttention: true };
       });
     });
+  };
+
+  const bulkPctValue = parseFloat(bulkPct.replace(",", "."));
+  const bulkPctValid = !isNaN(bulkPctValue) && bulkPctValue > 0;
+
+  // Shift every new price by ±bulkPct%. Items without a new price start from their current price,
+  // so repeated clicks compound on top of whatever is in the "Новая" column
+  const handleBulkAdjust = (direction: 1 | -1) => {
+    if (!bulkPctValid) return;
+    const factor = 1 + (direction * bulkPctValue) / 100;
+    setItems(prev => prev.map(item => {
+      const base = item.newPrice ?? item.currentPrice;
+      if (base <= 0) return item;
+      return { ...item, newPrice: Math.round(base * factor) };
+    }));
   };
 
   const handleApplyIndexItem = (id: string, currentPrice: number, index: number) => {
@@ -322,7 +400,10 @@ export default function RepricerPage() {
     if (!parsedData) return;
     try {
       setIsProcessing(true);
-      const blob = await exportOzonTemplate(parsedData, items);
+      const blob = await exportOzonTemplate(
+        parsedData,
+        items.map(item => ({ ...item, minPrice: minPriceFor(item).value }))
+      );
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -458,13 +539,55 @@ export default function RepricerPage() {
                      )}
                    </div>
                    <div className="flex flex-wrap items-center gap-3">
+                     <div
+                        className="flex items-center gap-1 p-1 bg-slate-100 rounded-xl shadow-sm"
+                        title="Изменить все новые цены на указанный процент. Если новая цена не задана — считается от текущей"
+                     >
+                        <button
+                          onClick={() => handleBulkAdjust(-1)}
+                          disabled={isProcessing || !bulkPctValid}
+                          className="p-2 rounded-lg text-slate-600 hover:bg-white hover:text-rose-600 hover:shadow-sm disabled:opacity-40 disabled:hover:bg-transparent transition-all active:scale-95"
+                          title="Снизить все новые цены"
+                        >
+                          <Minus className="w-4 h-4" />
+                        </button>
+                        <div className="flex items-center">
+                          <input
+                            type="number"
+                            min={0}
+                            step={1}
+                            value={bulkPct}
+                            onChange={(e) => setBulkPct(e.target.value)}
+                            className="w-12 py-1.5 bg-transparent text-center text-sm font-semibold text-slate-700 focus:outline-none [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+                            aria-label="Процент изменения цены"
+                          />
+                          <span className="text-sm font-semibold text-slate-500 pr-1">%</span>
+                        </div>
+                        <button
+                          onClick={() => handleBulkAdjust(1)}
+                          disabled={isProcessing || !bulkPctValid}
+                          className="p-2 rounded-lg text-slate-600 hover:bg-white hover:text-emerald-600 hover:shadow-sm disabled:opacity-40 disabled:hover:bg-transparent transition-all active:scale-95"
+                          title="Поднять все новые цены"
+                        >
+                          <Plus className="w-4 h-4" />
+                        </button>
+                     </div>
                      <button
-                        onClick={handleApplyIndexGlobal}
+                        onClick={() => handleApplyIndexGlobal()}
                         disabled={isProcessing}
                         className="flex items-center gap-2 px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-semibold rounded-xl shadow-sm transition-all active:scale-95"
                      >
                         <RefreshCw className="w-4 h-4" />
                         Корректировать по индексу (Все)
+                     </button>
+                     <button
+                        onClick={() => handleApplyIndexGlobal(true)}
+                        disabled={isProcessing}
+                        title="Поднять цену там, где индекс ниже 1. Товары, которым индекс снизил бы цену, остаются с текущей"
+                        className="flex items-center gap-2 px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 text-sm font-semibold rounded-xl shadow-sm transition-all active:scale-95"
+                     >
+                        <TrendingUp className="w-4 h-4" />
+                        Корректировать по индексу (Только вверх)
                      </button>
                      <button
                       onClick={handleDownload}
@@ -486,44 +609,40 @@ export default function RepricerPage() {
                           <th className="px-6 py-4 text-center">Индекс</th>
                           <th className="px-6 py-4 text-right">Текущая, ₽</th>
                           <th className="px-6 py-4">Новая, ₽</th>
+                          <th className="px-6 py-4 text-right" title="Ограничение для акций и стратегий: ниже этой цены Ozon не опустит цену при автодобавлении в акции. Считается как цена с маржой 0%, но не меньше 50% от новой цены (требование Ozon) и не выше неё">Мин., ₽</th>
                           <th className="px-6 py-4 text-right">Клиенту, ₽</th>
-                          <th className="px-6 py-4 text-right">Маржа (Прогноз)</th>
+                          <th className="px-6 py-4 text-right" title={`Чистая прибыль на единицу: цена − расходы Ozon − себестоимость − НДС ${vatRate}% (с вычетами по услугам Ozon и ${cogsVatShare}% себестоимости) − налог на прибыль ${incomeTaxRate}%. Та же модель, что «Реальная экономика» на странице начислений`}>Маржа (Прогноз)</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100/80">
                         {itemsWithGroups.map((item) => {
-                          // Determine the most accurate discount available
-                          const reportDiscount = accrualsDiscountMap[item.article];
-                          const discountToUse = reportDiscount !== undefined && reportDiscount > 0 ? reportDiscount : item.ozonDiscountPct;
-                          const sourceOfDiscount = reportDiscount !== undefined && reportDiscount > 0 ? "по отчету" : "шаблон";
+                          // Prefer the template discount: it's a fresh snapshot of what the buyer pays right now,
+                          // while the report discount is a period average that lags behind recent price changes
+                          const reportDiscount = accrualsDiscountMap[item.article] ?? 0;
+                          const useTemplateDiscount = item.ozonDiscountPct > 0;
+                          const discountToUse = useTemplateDiscount ? item.ozonDiscountPct : reportDiscount;
+                          const sourceOfDiscount = useTemplateDiscount ? "по шаблону" : "по отчету";
 
                           // Calculate predicted customer price
                           const basePrice = item.newPrice ?? item.currentPrice;
                           const predictedCustomerPrice = basePrice * (1 - discountToUse);
 
+                          const minPrice = minPriceFor(item);
+                          const breakEvenLabel = minPrice.breakEven === null
+                            ? ""
+                            : `0% при ${new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 }).format(minPrice.breakEven)} ₽`;
+                          const minPriceHint = {
+                            fallback: "50% — нет данных для расчёта",
+                            capped: `= цене, ${breakEvenLabel}`,
+                            ozonMin: `50% от цены, ${breakEvenLabel}`,
+                            breakeven: "маржа 0%",
+                          }[minPrice.source];
+
                           // Calculate Margin
-                          const metrics = skuMetricsMap[item.article];
                           const cogs = skuCogs[item.article] || 0;
-                          
-                          let expectedProfit: number | null = null;
-                          let expectedMarginPct: number | null = null;
-                          const taxRate = 0.25;
-                          
-                          if (metrics) {
-                            const varExp = basePrice * metrics.variablePct;
-                            const fixExp = metrics.fixedRubPerUnit + globalFixedRubPerUnit;
-                            const taxableProfit = basePrice - varExp - fixExp - cogs;
-                            const taxAmount = Math.max(0, taxableProfit * taxRate);
-                            expectedProfit = taxableProfit - taxAmount;
-                            expectedMarginPct = basePrice > 0 ? expectedProfit / basePrice : 0;
-                          } else if (cogs > 0) {
-                            const varExp = basePrice * globalVariablePct;
-                            const fixExp = avgSkuFixedRubPerUnit + globalFixedRubPerUnit;
-                            const taxableProfit = basePrice - varExp - fixExp - cogs;
-                            const taxAmount = Math.max(0, taxableProfit * taxRate);
-                            expectedProfit = taxableProfit - taxAmount;
-                            expectedMarginPct = basePrice > 0 ? expectedProfit / basePrice : 0;
-                          }
+                          const econ = unitEconomics(item.article);
+                          const expectedProfit = econ ? profitAt(econ, basePrice) : null;
+                          const expectedMarginPct = expectedProfit !== null && basePrice > 0 ? expectedProfit / basePrice : null;
 
                           return (
                             <tr key={item.id} className={cn(
@@ -576,6 +695,17 @@ export default function RepricerPage() {
                                 />
                               </td>
                               <td className="px-6 py-4 text-right">
+                                <div className="flex flex-col items-end">
+                                  <span className={cn(
+                                    "font-medium",
+                                    minPrice.source === "fallback" ? "text-slate-400" : minPrice.source === "capped" ? "text-amber-600" : "text-slate-700"
+                                  )}>
+                                    {new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB", maximumFractionDigits: 0 }).format(minPrice.value)}
+                                  </span>
+                                  <span className="text-[10px] text-slate-400 mt-0.5">{minPriceHint}</span>
+                                </div>
+                              </td>
+                              <td className="px-6 py-4 text-right">
                                 <div className="flex items-center justify-end gap-2">
                                   <span className="font-bold text-emerald-600">
                                     {new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB" }).format(predictedCustomerPrice)}
@@ -609,7 +739,9 @@ export default function RepricerPage() {
                                 ) : (
                                   <div className="flex flex-col items-end">
                                     <span className="text-slate-400 text-sm">—</span>
-                                    {cogs === 0 && <span className="text-[10px] text-amber-500 mt-0.5">Нет себестоимости</span>}
+                                    <span className="text-[10px] text-amber-500 mt-0.5">
+                                      {!accrualsResult ? "Нет отчёта о начислениях" : cogs === 0 ? "Нет себестоимости" : "Нет данных"}
+                                    </span>
                                   </div>
                                 )}
                               </td>

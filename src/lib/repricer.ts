@@ -7,10 +7,11 @@ export interface RepricerItem {
   newPrice: number | null;
   multiplier: number; // to calculate new price before discount
   priceIndex: number | null; // from 'Ценовой индекс товара на рынке на мои товары'
-  customerPrice: number | null; // from 'Цена с учетом скидки от Ozon, руб.'
+  customerPrice: number | null; // from 'Цена реализации, руб.' (what the buyer actually pays)
   ozonDiscountPct: number; // calculated discount percentage provided by Ozon
   rowIndex: number; // to keep track of where to write back
   needsAttention?: boolean; // highlight if no index was found
+  minPrice?: number | null; // promo floor to export ("Ограничение для акций и стратегий"); computed on the page
 }
 
 export interface ParsedTemplate {
@@ -18,6 +19,79 @@ export interface ParsedTemplate {
   workbook: XLSX.WorkBook;
   sheetName: string;
   headerRowIndex: number;
+  columns: TemplateColumns;
+}
+
+export interface TemplateColumns {
+  article: number;
+  strikePrice: number; // "Зачёркнутая цена" — price shown crossed out
+  currentPrice: number; // "Предельная цена без акций" — price the seller sets manually
+  customerPrice: number;
+  priceIndex: number;
+  newPrice: number;
+  newStrikePrice: number;
+  newMinPrice: number;
+  autoDisable: number[]; // "Подключать подходящие акции", "Автоматически добавлять товар в акции"
+}
+
+// Ozon periodically renames the template columns. Each role lists the known header
+// variants, newest first; a header matches when it starts with the variant
+// (case-insensitive, ё/е-insensitive), so suffixes like ", руб." don't matter.
+const COLUMN_ALIASES = {
+  article: ["Артикул"],
+  strikePrice: ["Зачёркнутая цена", "Цена до скидки"],
+  currentPrice: ["Предельная цена без акций", "Текущая цена (со скидкой)"],
+  customerPrice: ["Цена реализации", "Цена с учетом скидки от Ozon"],
+  priceIndex: ["Ценовой индекс товара на рынке на мои товары"],
+  newPrice: ["Новая предельная цена без акций", "Новая цена (со скидкой)"],
+  newStrikePrice: ["Новая зачёркнутая цена", "Новая цена до скидки"],
+  newMinPrice: ["Новое ограничение для акций и стратегий", "Новая минимальная цена"],
+} as const;
+
+function normalizeHeader(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase().replace(/ё/g, "е");
+}
+
+function findColumn(headers: unknown[], aliases: readonly string[]): number {
+  for (const alias of aliases) {
+    const needle = normalizeHeader(alias);
+    const idx = headers.findIndex((h) => normalizeHeader(h).startsWith(needle));
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+function requireColumn(headers: unknown[], aliases: readonly string[]): number {
+  const idx = findColumn(headers, aliases);
+  if (idx === -1) {
+    const [current, ...legacy] = aliases;
+    const hint = legacy.length ? ` (в старых шаблонах — ${legacy.map((a) => `'${a}'`).join(", ")})` : "";
+    throw new Error(`Не найден столбец '${current}'${hint}. Скачайте актуальный шаблон обновления цен в личном кабинете Ozon.`);
+  }
+  return idx;
+}
+
+export function resolveTemplateColumns(headers: unknown[]): TemplateColumns {
+  // Columns that get "НЕТ" on export so Ozon doesn't auto-enroll repriced items into promos
+  const autoDisable: number[] = [];
+  headers.forEach((h, idx) => {
+    const lower = normalizeHeader(h);
+    if (lower.includes("подключать") || lower.includes("автоматиче")) {
+      autoDisable.push(idx);
+    }
+  });
+
+  return {
+    article: requireColumn(headers, COLUMN_ALIASES.article),
+    strikePrice: findColumn(headers, COLUMN_ALIASES.strikePrice),
+    currentPrice: requireColumn(headers, COLUMN_ALIASES.currentPrice),
+    customerPrice: findColumn(headers, COLUMN_ALIASES.customerPrice),
+    priceIndex: findColumn(headers, COLUMN_ALIASES.priceIndex),
+    newPrice: requireColumn(headers, COLUMN_ALIASES.newPrice),
+    newStrikePrice: findColumn(headers, COLUMN_ALIASES.newStrikePrice),
+    newMinPrice: findColumn(headers, COLUMN_ALIASES.newMinPrice),
+    autoDisable,
+  };
 }
 
 export async function parseOzonTemplate(file: File): Promise<ParsedTemplate> {
@@ -53,16 +127,15 @@ export async function parseOzonTemplate(file: File): Promise<ParsedTemplate> {
         }
 
         const headers = json[headerRowIndex];
-        const articleCol = headers.indexOf("Артикул");
-        const oldPriceCol = headers.findIndex((h: string) => h && h.includes("Цена до скидки"));
-        const currentPriceCol = headers.findIndex((h: string) => h && h.includes("Текущая цена (со скидкой)"));
-        const newPriceCol = headers.findIndex((h: string) => h && h.includes("Новая цена (со скидкой)"));
-        const priceIndexCol = headers.findIndex((h: string) => h && h.includes("Ценовой индекс товара на рынке на мои товары"));
-        const customerPriceCol = headers.findIndex((h: string) => h && h.includes("Цена с учетом скидки от Ozon"));
-
-        if (articleCol === -1) throw new Error("Не найден столбец 'Артикул'");
-        if (currentPriceCol === -1) throw new Error("Не найден столбец 'Текущая цена (со скидкой)'");
-        if (newPriceCol === -1) throw new Error("Не найден столбец 'Новая цена (со скидкой)'");
+        const columns = resolveTemplateColumns(headers);
+        const {
+          article: articleCol,
+          strikePrice: oldPriceCol,
+          currentPrice: currentPriceCol,
+          newPrice: newPriceCol,
+          priceIndex: priceIndexCol,
+          customerPrice: customerPriceCol,
+        } = columns;
 
         const items: RepricerItem[] = [];
 
@@ -122,6 +195,7 @@ export async function parseOzonTemplate(file: File): Promise<ParsedTemplate> {
           workbook,
           sheetName,
           headerRowIndex,
+          columns,
         });
 
       } catch (err) {
@@ -134,27 +208,14 @@ export async function parseOzonTemplate(file: File): Promise<ParsedTemplate> {
 }
 
 export async function exportOzonTemplate(parsed: ParsedTemplate, updatedItems: RepricerItem[]): Promise<Blob> {
-  const { workbook, sheetName, headerRowIndex } = parsed;
+  const { workbook, sheetName } = parsed;
   const sheet = workbook.Sheets[sheetName];
-  
-  const json = XLSX.utils.sheet_to_json<any[]>(sheet, { header: 1 });
-  const headers = json[headerRowIndex];
-  const newPriceCol = headers.findIndex((h: any) => h && String(h).includes("Новая цена (со скидкой)"));
-  const newPriceNoDiscountCol = headers.findIndex((h: any) => h && String(h).includes("Новая цена до скидки"));
-  const minPriceCol = headers.findIndex((h: any) => {
-    const lower = String(h).toLowerCase();
-    return lower.includes("новая") && lower.includes("минимальн");
-  });
-
-  // Find all columns related to "Подключать" or "Автоматическое..."
-  const autoDisableCols: number[] = [];
-  headers.forEach((h: any, idx: number) => {
-    if (!h) return;
-    const lower = String(h).toLowerCase();
-    if (lower.includes("подключать") || lower.includes("автоматиче")) {
-      autoDisableCols.push(idx);
-    }
-  });
+  const {
+    newPrice: newPriceCol,
+    newStrikePrice: newPriceNoDiscountCol,
+    newMinPrice: minPriceCol,
+    autoDisable: autoDisableCols,
+  } = parsed.columns;
 
   updatedItems.forEach((item) => {
     if (item.newPrice !== null && item.newPrice !== undefined) {
@@ -179,9 +240,9 @@ export async function exportOzonTemplate(parsed: ParsedTemplate, updatedItems: R
           }
       }
 
-      // Automatically calculate "minimum price" as 50% of the new price
+      // Promo floor: the page passes a break-even based value; fall back to 50% of the new price
       if (minPriceCol !== -1) {
-          const autoMinPrice = Math.round(item.newPrice * 0.5);
+          const autoMinPrice = item.minPrice ?? Math.round(item.newPrice * 0.5);
           const cellRefMin = XLSX.utils.encode_cell({ c: minPriceCol, r: item.rowIndex });
           if (!sheet[cellRefMin]) {
              sheet[cellRefMin] = { t: 'n', v: autoMinPrice };

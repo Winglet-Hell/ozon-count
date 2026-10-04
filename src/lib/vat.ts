@@ -32,23 +32,36 @@ const isRevenueGroup = (group: string): boolean => {
 };
 
 /**
- * Начисления вне НДС: компенсации ущерба, декомпенсации, штрафы и пени.
+ * Начисления без входящего НДС — по ним нет вычета. Сверено с документами Ozon за сентябрь 2026:
  *
- * Проверяем по типу начисления, а не по группе: в группе «Другие услуги и штрафы»
- * вместе со штрафами лежат обычные услуги Ozon с НДС — упаковка, утилизация.
+ * • Группа «Услуги партнёров» — доставка до места выдачи, эквайринг, упаковка и обработка
+ *   невыкупов партнёрами, drop-off, временное размещение. Ozon перевыставляет их как агент,
+ *   а исполнители в основном работают без НДС: по «Отчёту о перевыставлении услуг» НДС в них
+ *   0,6% от суммы, а не 22/122.
+ * • Страхование товара — не облагается (пп. 7 п. 3 ст. 149 НК РФ, «Акт о страховой премии»).
+ * • Компенсации, декомпенсации, штрафы и пени — в УПД их нет.
+ *
+ * Собственные услуги Ozon — вознаграждение, логистика FBO/FBS, кросс-докинг, реклама, упаковочные
+ * материалы, утилизация — приходят в УПД по ставке 22%. Поэтому кроме групп проверяем тип начисления:
+ * в группе «Другие услуги и штрафы» штрафы лежат вместе с такими услугами.
  */
+const VAT_FREE_GROUPS = ["услуги партн"];
+
 const VAT_FREE_KEYWORDS = [
   "компенсац",
   "штраф",
   "пени",
   "неустойк",
   "превышение индекса",
-  "нерекомендованный слот"
+  "нерекомендованный слот",
+  "жалоб",
+  "страхован"
 ];
 
-export const isVatFree = (type: string): boolean => {
+export const isVatFree = (group: string, type: string): boolean => {
+  const g = group.toLowerCase();
   const t = type.toLowerCase();
-  return VAT_FREE_KEYWORDS.some((k) => t.includes(k));
+  return VAT_FREE_GROUPS.some((k) => g.includes(k)) || VAT_FREE_KEYWORDS.some((k) => t.includes(k));
 };
 
 export interface VatFlowSplit {
@@ -56,7 +69,7 @@ export interface VatFlowSplit {
   revenueGross: number;
   /** Услуги Ozon с НДС, положительное число */
   servicesVatableGross: number;
-  /** Компенсации и штрафы вне НДС, положительное число */
+  /** Услуги партнёров, страхование, компенсации и штрафы без входящего НДС, положительное число */
   servicesVatFreeGross: number;
 }
 
@@ -74,7 +87,7 @@ export const splitFlowForVat = (
   items.forEach(({ group, type, amount }) => {
     if (isRevenueGroup(group)) {
       revenueGross += amount;
-    } else if (isVatFree(type)) {
+    } else if (isVatFree(group, type)) {
       servicesVatFreeGross -= amount;
     } else {
       servicesVatableGross -= amount;

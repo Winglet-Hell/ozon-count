@@ -4,9 +4,11 @@ import { useState, useCallback, useEffect } from "react";
 import { Upload, Loader2, Coins, TrendingUp, TrendingDown, ReceiptText, ArrowRightLeft, FileSpreadsheet, Info, Percent, AlertTriangle, Check, FileDown, Landmark, ChevronDown } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Header } from "@/components/Header";
-import { parseAccrualsReport, parseCogsCsv, parseCogsXlsx, type AccrualsSummary, type AccrualsBreakdownItem } from "@/lib/parseAccruals";
+import { parseAccrualsReport, parseCogsCsv, parseCogsXlsx, fetchArchivedCogs, loadDefaultCogs, type AccrualsBreakdownItem } from "@/lib/parseAccruals";
 import { computeVat, splitFlowForVat, isVatFree, vatFraction, type VatResult } from "@/lib/vat";
+import { suggestCogs } from "@/lib/cogsSuggest";
 import { cn } from "@/lib/utils";
+import { CogsInput } from "@/components/CogsInput";
 
 import { useAppState } from "@/components/StoreProvider";
 
@@ -34,8 +36,13 @@ const getCategoryFromArticle = (article: string): string => {
   if (artLower.includes("жилет")) return "Жилеты";
   if (artLower.includes("рубашк")) return "Рубашки";
   if (artLower.includes("носк")) return "Носки";
-  return "Прочее";
+  // Новые виды товара — по первому слову после артикула: «6-835-4/1-38-39. Чуни темно-бежевые»
+  const kind = article.match(/\.\s+([А-Яа-яЁёA-Za-z]+)/)?.[1];
+  return kind ? kind[0].toUpperCase() + kind.slice(1).toLowerCase() : "Прочее";
 };
+
+const isSalesGroup = (group: string) => group.toLowerCase().includes("продажи");
+const isReturnsGroup = (group: string) => group.toLowerCase().includes("возвраты");
 
 const isCommission = (group: string, type: string): boolean => {
   const g = group.toLowerCase();
@@ -73,7 +80,7 @@ export default function AccrualsPage() {
   const [isProcessing, setIsProcessing] = useState(false);
   const {
     accrualsResult: result, setAccrualsResult: setResult,
-    skuCogs, setSkuCogs,
+    skuCogs, setFileCogs, ozonCogs, cogsEdits, setCogsEdits,
     cogsFileName, setCogsFileName,
     vatRate, setVatRate,
     cogsVatShare, setCogsVatShare,
@@ -94,54 +101,16 @@ export default function AccrualsPage() {
   const [cogsRate, setCogsRate] = useState<number | null>(null);
   const [categoryGrowth, setCategoryGrowth] = useState<Record<string, number>>({});
 
-  // Auto-load default себестоимость file on mount (prefers XLSX template if available)
+  // Себестоимость по умолчанию — только если базы еще нет. Иначе при каждом возврате на страницу
+  // загруженный пользователем файл молча подменялся бы шаблоном из public
   useEffect(() => {
-    const fetchDefaultCogs = async () => {
-      try {
-        let finalCogs: Record<string, number> = {};
-        let finalName = "";
-
-        // Try XLSX template first
-        const xlsxRes = await fetch("/Шаблон для обновления цен_18.06.26 (2).xlsx");
-        if (xlsxRes.ok) {
-          const blob = await xlsxRes.blob();
-          const file = new File([blob], "Шаблон для обновления цен_18.06.26 (2).xlsx");
-          finalCogs = await parseCogsXlsx(file);
-          finalName = "Шаблон для обновления цен_18.06.26 (2).xlsx (авто)";
-        } else {
-          // Fallback to CSV database
-          const csvRes = await fetch("/Товары что мы продаем.csv");
-          if (csvRes.ok) {
-            const text = await csvRes.text();
-            finalCogs = parseCogsCsv(text);
-            finalName = "Товары что мы продаем.csv (авто)";
-          }
-        }
-
-        // Merge with archived COGS
-        try {
-          const archRes = await fetch("/archived_cogs.csv");
-          if (archRes.ok) {
-            const text = await archRes.text();
-            const archCogs = parseCogsCsv(text);
-            finalCogs = { ...finalCogs, ...archCogs };
-            if (finalName) {
-              finalName += " + Архив";
-            } else {
-              finalName = "archived_cogs.csv (авто)";
-            }
-          }
-        } catch (e) {}
-
-        if (Object.keys(finalCogs).length > 0) {
-          setSkuCogs(finalCogs);
-          setCogsFileName(finalName);
-        }
-      } catch (err) {
-        console.error("Ошибка автозагрузки себестоимости:", err);
-      }
-    };
-    fetchDefaultCogs();
+    if (cogsFileName) return;
+    loadDefaultCogs().then((loaded) => {
+      if (!loaded) return;
+      // Пока шел запрос, пользователь мог загрузить свой файл — его не трогаем
+      setFileCogs((prev) => (Object.keys(prev).length > 0 ? prev : loaded.cogs));
+      setCogsFileName((prev) => prev ?? loaded.fileName);
+    });
   }, []);
 
   const handleCogsFile = useCallback(async (file: File) => {
@@ -154,21 +123,16 @@ export default function AccrualsPage() {
         parsed = parseCogsCsv(text);
       } else if (file.name.endsWith(".xlsx")) {
         parsed = await parseCogsXlsx(file);
+      } else if (file.name.endsWith(".xls")) {
+        throw new Error("Отчет «Остатки» из учетной системы загрузите в репрайсере, рядом с шаблоном цен: товары сопоставляются по штрихкоду из шаблона");
       } else {
         throw new Error("Пожалуйста, загрузите себестоимость в формате CSV (.csv) или Excel (.xlsx)");
       }
 
-      // Automatically merge with archived COGS if available
-      try {
-        const archRes = await fetch("/archived_cogs.csv");
-        if (archRes.ok) {
-          const text = await archRes.text();
-          const archCogs = parseCogsCsv(text);
-          parsed = { ...parsed, ...archCogs };
-        }
-      } catch (e) {}
+      // Архив только дополняет загруженный файл: свежие значения важнее старых
+      parsed = { ...(await fetchArchivedCogs()), ...parsed };
 
-      setSkuCogs(parsed);
+      setFileCogs(parsed);
       setCogsFileName(file.name + " + Архив");
 
     } catch (err) {
@@ -234,24 +198,25 @@ export default function AccrualsPage() {
   let scaledBaseProductionCogs = 0;
   const missingCogsSkus: Record<string, { qty: number }> = {};
 
-  const categoryData: Record<string, { sold: number; returned: number; revenue: number }> = {
-    "Тапочки": { sold: 0, returned: 0, revenue: 0 },
-    "Жилеты": { sold: 0, returned: 0, revenue: 0 },
-    "Рубашки": { sold: 0, returned: 0, revenue: 0 },
-    "Носки": { sold: 0, returned: 0, revenue: 0 },
-    "Прочее": { sold: 0, returned: 0, revenue: 0 }
-  };
+  const categoryData: Record<string, { sold: number; returned: number; revenue: number }> = {};
 
   if (result && result.skuTransactions) {
     result.skuTransactions.forEach((tx) => {
+      if (!isSalesGroup(tx.group) && !isReturnsGroup(tx.group)) return;
+
+      const category = getCategoryFromArticle(tx.sku);
+      const categoryRow = categoryData[category] ?? (categoryData[category] = { sold: 0, returned: 0, revenue: 0 });
+      // Продажи категории — та же база, что у всей страницы: выручка, баллы за скидки
+      // и программы партнеров за вычетом возвратов. Одна «Выручка» — только доля покупателя
+      categoryRow.revenue += tx.amount;
+
       const isSale = tx.group === "Продажи" && tx.type === "Выручка";
       const isReturn = tx.group === "Возвраты" && tx.type === "Возврат выручки";
 
       if (isSale || isReturn) {
         const cogsRateVal = skuCogs[tx.sku] || 0;
-        const qty = tx.quantity;
-        const amt = tx.amount;
-        const category = getCategoryFromArticle(tx.sku);
+        // Строка выручки с минусом — сторно продажи: количество в ней положительное, а единицу она забирает
+        const qty = isSale && tx.amount < 0 ? -tx.quantity : tx.quantity;
         const growth = isForecastMode ? (categoryGrowth[category] ?? 1) : 1;
 
         if (cogsRateVal === 0) {
@@ -266,17 +231,26 @@ export default function AccrualsPage() {
         if (isSale) {
           baseProductionCogs += rowCogs;
           scaledBaseProductionCogs += scaledRowCogs;
-          categoryData[category].sold += qty;
-          categoryData[category].revenue += amt;
+          categoryRow.sold += qty;
         } else if (isReturn) {
           baseProductionCogs -= rowCogs;
           scaledBaseProductionCogs -= scaledRowCogs;
-          categoryData[category].returned += qty;
-          categoryData[category].revenue += amt;
+          categoryRow.returned += qty;
         }
       }
     });
   }
+
+  const missingCogsSuggestions = suggestCogs(Object.keys(missingCogsSkus), skuCogs);
+  const ozonCogsCount = Object.keys(ozonCogs).length;
+  const cogsEditsCount = Object.keys(cogsEdits).length;
+  const cogsSource = [
+    cogsFileName,
+    ozonCogsCount ? `из шаблона Ozon: ${ozonCogsCount}` : null,
+    cogsEditsCount ? `новая, еще не в Ozon: ${cogsEditsCount}` : null
+  ]
+    .filter(Boolean)
+    .join(" + ");
 
   const activeCategories = Object.entries(categoryData)
     .map(([name, data]) => ({
@@ -601,9 +575,6 @@ export default function AccrualsPage() {
   // Это именно продажи, а не карточка «Поступило денег»: та считает возвраты комиссий
   // и отмены начислений отдельным приходом, тогда как здесь они уменьшают списания.
   // Поэтому строки сводки и прибыль сходятся с базой ровно в 100%.
-  const isSalesGroup = (group: string) => group.toLowerCase().includes("продажи");
-  const isReturnsGroup = (group: string) => group.toLowerCase().includes("возвраты");
-
   let salesBase = 0;
   let ozonSpend = 0;
   // Раздельно для цены безубыточности: возвраты и комиссия — процент от цены,
@@ -623,7 +594,7 @@ export default function AccrualsPage() {
 
     if (isReturnsGroup(item.group)) returnsSpend += spend;
     else if (isCommission(item.group, item.type)) commissionSpend += spend;
-    else if (isVatFree(item.type)) fixedVatFree += spend;
+    else if (isVatFree(item.group, item.type)) fixedVatFree += spend;
     else fixedVatable += spend;
   });
 
@@ -638,9 +609,11 @@ export default function AccrualsPage() {
   const adjustedMargin = salesBase ? (adjustedNetResult / salesBase) * 100 : 0;
   const actualRealMargin = actualSalesBase ? (actualRealNetResult / actualSalesBase) * 100 : 0;
 
-  // Штук нетто за период — чтобы показать каждую статью в рублях на единицу товара
-  const netUnits = activeCategories.reduce(
-    (sum, cat) => sum + cat.net * (isForecastMode ? (categoryGrowth[cat.name] ?? 1) : 1),
+  // Штук продано за период — на них делим статьи и считаем среднюю цену. Делить на штуки
+  // за вычетом возвратов нельзя: продажи в базе идут до возвратов, а сами возвраты — отдельная
+  // статья списаний, и средняя цена получилась бы завышенной на долю возвратов.
+  const soldUnits = activeCategories.reduce(
+    (sum, cat) => sum + cat.sold * (isForecastMode ? (categoryGrowth[cat.name] ?? 1) : 1),
     0
   );
 
@@ -654,7 +627,7 @@ export default function AccrualsPage() {
     .map((b) => ({
       ...b,
       pct: salesBase ? (b.amount / salesBase) * 100 : 0,
-      perUnit: netUnits ? b.amount / netUnits : 0
+      perUnit: soldUnits ? b.amount / soldUnits : 0
     }));
 
   // Цена безубыточности за единицу.
@@ -668,8 +641,8 @@ export default function AccrualsPage() {
   const fixedCosts = fixedVatable + fixedVatFree + totalProductionCogs;
   const fixedDeductible = fixedVatable + totalProductionCogs * (cogsVatShare / 100);
 
-  const currentPricePerUnit = netUnits ? salesBase / netUnits : 0;
-  const priceModelWorks = netUnits > 0 && variableMargin > 0;
+  const currentPricePerUnit = soldUnits ? salesBase / soldUnits : 0;
+  const priceModelWorks = soldUnits > 0 && variableMargin > 0;
 
   // Вклад в покрытие с рубля цены и фиксированные затраты, очищенные от вычета
   const contribution = variableMargin * (1 - r);
@@ -707,7 +680,7 @@ export default function AccrualsPage() {
             <button
               onClick={() => document.getElementById("csv-file-upload-active")?.click()}
               className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold rounded-lg transition-all bg-transparent text-slate-600 border border-transparent hover:bg-slate-100 hover:text-slate-900"
-              title={cogsFileName ? `Себестоимость: ${cogsFileName}` : "Загрузить себестоимость"}
+              title={cogsSource ? `Себестоимость: ${cogsSource}` : "Загрузить себестоимость"}
             >
               {isCogsLoading ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -722,7 +695,7 @@ export default function AccrualsPage() {
               id="csv-file-upload-active"
               type="file"
               className="hidden"
-              accept=".csv,.xlsx"
+              accept=".csv,.xlsx,.xls"
               onChange={(e) => {
                 if (e.target.files && e.target.files[0]) {
                   handleCogsFile(e.target.files[0]);
@@ -825,8 +798,8 @@ export default function AccrualsPage() {
                       <div>
                         <h4 className="text-sm font-bold text-slate-800">База себестоимости</h4>
                         <p className="text-xs text-slate-500 mt-0.5">
-                          {cogsFileName 
-                            ? `${cogsFileName} (${Object.keys(skuCogs).length} арт.)`
+                          {cogsSource
+                            ? `${cogsSource} (${Object.keys(skuCogs).length} арт.)`
                             : "Не загружена (себестоимость = 0)"}
                         </p>
                       </div>
@@ -847,7 +820,7 @@ export default function AccrualsPage() {
                         id="csv-file-upload"
                         type="file"
                         className="hidden"
-                        accept=".csv,.xlsx"
+                        accept=".csv,.xlsx,.xls"
                         onChange={(e) => {
                           if (e.target.files && e.target.files[0]) {
                             handleCogsFile(e.target.files[0]);
@@ -1089,29 +1062,49 @@ export default function AccrualsPage() {
                   {/* Missing SKU Warnings */}
                 {Object.keys(missingCogsSkus).length > 0 && (
                   <div className="p-6 bg-amber-50/50 border border-amber-200/60 rounded-3xl space-y-4 shadow-sm">
-                    <div className="flex items-start gap-4">
-                      <div className="p-3 bg-amber-100 text-amber-600 rounded-2xl shrink-0">
-                        <AlertTriangle className="w-6 h-6" />
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div className="flex items-start gap-4">
+                        <div className="p-3 bg-amber-100 text-amber-600 rounded-2xl shrink-0">
+                          <AlertTriangle className="w-6 h-6" />
+                        </div>
+                        <div className="space-y-1">
+                          <h4 className="text-base font-bold text-amber-900">
+                            Внимание: найдены артикулы без себестоимости ({Object.keys(missingCogsSkus).length} шт.)
+                          </h4>
+                          <p className="text-sm text-amber-800/80 leading-relaxed max-w-3xl">
+                            Пока себестоимость не введена, она считается равной 0 и прибыль завышена. Введите ее здесь
+                            или в репрайсере — оттуда она уйдет в Ozon вместе с ценами. «≈» — подсказка по соседнему
+                            размеру или цвету той же модели.
+                          </p>
+                        </div>
                       </div>
-                      <div className="space-y-1">
-                        <h4 className="text-base font-bold text-amber-900">
-                          Внимание: найдены артикулы без себестоимости ({Object.keys(missingCogsSkus).length} шт.)
-                        </h4>
-                        <p className="text-sm text-amber-800/80 leading-relaxed max-w-3xl">
-                          В отчете есть продажи для товаров, которых нет в вашей базе себестоимости. Для расчетов их себестоимость принята за 0. Рекомендуется обновить CSV/Excel базу.
-                        </p>
-                      </div>
+                      {Object.keys(missingCogsSuggestions).length > 0 && (
+                        <button
+                          onClick={() => setCogsEdits(Object.fromEntries(
+                            Object.entries(missingCogsSuggestions).map(([sku, suggestion]) => [sku, suggestion.value])
+                          ))}
+                          className="flex items-center gap-2 px-4 py-2 bg-white hover:bg-amber-100 border border-amber-200 text-amber-800 text-sm font-semibold rounded-xl shadow-sm transition-colors"
+                        >
+                          <Check className="w-4 h-4" />
+                          Принять подсказки ({Object.keys(missingCogsSuggestions).length})
+                        </button>
+                      )}
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      {Object.entries(missingCogsSkus).slice(0, 10).map(([sku, data]) => (
-                        <span key={sku} className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-amber-200/60 rounded-lg text-sm font-medium text-slate-700">
+                      {Object.entries(missingCogsSkus).slice(0, 12).map(([sku, data]) => (
+                        <span key={sku} className="inline-flex items-center gap-2 pl-3 pr-1.5 py-1 bg-white border border-amber-200/60 rounded-lg text-sm font-medium text-slate-700">
                           <span className="font-mono text-slate-600">{sku}</span>
                           <span className="text-amber-600 font-bold bg-amber-50 px-1.5 rounded">{data.qty} шт.</span>
+                          <CogsInput
+                            value={undefined}
+                            suggestion={missingCogsSuggestions[sku]}
+                            onCommit={(value) => setCogsEdits({ [sku]: value })}
+                          />
                         </span>
                       ))}
-                      {Object.keys(missingCogsSkus).length > 10 && (
+                      {Object.keys(missingCogsSkus).length > 12 && (
                         <span className="inline-flex items-center px-3 py-1.5 bg-transparent text-sm font-medium text-amber-700">
-                          + еще {Object.keys(missingCogsSkus).length - 10} артикулов
+                          + еще {Object.keys(missingCogsSkus).length - 12} артикулов
                         </span>
                       )}
                     </div>
@@ -1241,7 +1234,7 @@ export default function AccrualsPage() {
                     items={moneyStructure}
                     base={salesBase}
                     netProfit={adjustedNetResult}
-                    netUnits={netUnits}
+                    soldUnits={soldUnits}
                     currentPrice={currentPricePerUnit}
                     breakEvenPrice={breakEvenPrice}
                     marginOptions={marginPriceOptions}
@@ -1285,7 +1278,7 @@ export default function AccrualsPage() {
                                 <span className="font-bold text-rose-500">{displayReturned}</span>
                               </div>
                               <div className="flex justify-between items-center pt-2 border-t border-slate-100">
-                                <span className="text-slate-500">Выручка:</span>
+                                <span className="text-slate-500" title="С НДС: выручка, баллы за скидки и программы партнеров за вычетом возвратов">Продажи:</span>
                                 <span className="font-bold text-emerald-600" title={formatCurrency(displayRevenue)}>
                                   {formatCurrency(displayRevenue, true)}
                                 </span>
@@ -1577,7 +1570,7 @@ function MoneyStructure({
   items,
   base,
   netProfit,
-  netUnits,
+  soldUnits,
   currentPrice,
   breakEvenPrice,
   marginOptions,
@@ -1586,7 +1579,7 @@ function MoneyStructure({
   items: { label: string; hint: string; color: string; amount: number; pct: number; perUnit: number }[];
   base: number;
   netProfit: number;
-  netUnits: number;
+  soldUnits: number;
   currentPrice: number;
   breakEvenPrice: number | null;
   marginOptions: { margin: number; price: number | null }[];
@@ -1594,13 +1587,13 @@ function MoneyStructure({
 }) {
   const netPct = base ? (netProfit / base) * 100 : 0;
   const isProfit = netProfit >= 0;
-  const units = Math.round(netUnits);
-  const perUnit = (value: number) => (netUnits ? value / netUnits : 0);
+  const units = Math.round(soldUnits);
+  const perUnit = (value: number) => (soldUnits ? value / soldUnits : 0);
 
   return (
     <CollapsiblePanel
       title="Куда уходят деньги"
-      subtitle={units > 0 ? `${units} шт. за период` : undefined}
+      subtitle={units > 0 ? `${units} шт. продано` : undefined}
       summaryLabel={isProfit ? "Осталось" : "Убыток"}
       summaryValue={formatCurrency(netProfit)}
     >
@@ -1635,7 +1628,7 @@ function MoneyStructure({
               <div className="text-sm font-bold text-slate-500 tabular-nums whitespace-nowrap" title={formatCurrency(item.amount)}>
                 {formatCurrency(item.amount, true)}
               </div>
-              {netUnits > 0 && (
+              {soldUnits > 0 && (
                 <div
                   className="text-xs text-slate-400 tabular-nums whitespace-nowrap"
                   title={`${formatCurrency(item.perUnit)} на единицу товара`}
@@ -1665,7 +1658,7 @@ function MoneyStructure({
             >
               {formatCurrency(netProfit, true)}
             </div>
-            {netUnits > 0 && (
+            {soldUnits > 0 && (
               <div
                 className={cn("text-xs tabular-nums whitespace-nowrap", isProfit ? "text-emerald-500/70" : "text-rose-500/70")}
                 title={`${formatCurrency(perUnit(netProfit))} на единицу товара`}
@@ -1857,7 +1850,7 @@ function TaxPanel({
             />
             <VatRow
               label="Вычет по услугам Ozon"
-              caption={`База ${formatCurrency(vat.servicesVatableGross, true)} — комиссия, логистика, реклама, эквайринг`}
+              caption={`База ${formatCurrency(vat.servicesVatableGross, true)} — комиссия, логистика, кросс-докинг, реклама`}
               value={vat.vatInputServices}
               sign="minus"
             />
@@ -1878,8 +1871,9 @@ function TaxPanel({
 
           {vat.servicesVatFreeGross > 0 && (
             <p className="text-xs text-slate-400 mt-4 leading-relaxed">
-              Вне НДС: {formatCurrency(vat.servicesVatFreeGross)} — компенсации, декомпенсации и штрафы.
-              В вычет не идут, но уменьшают базу налога на прибыль.
+              Без вычета: {formatCurrency(vat.servicesVatFreeGross)} — услуги партнёров (доставка до ПВЗ,
+              эквайринг, упаковка), страхование, компенсации и штрафы. Партнёры Ozon в основном
+              работают без НДС, страхование им не облагается. Эти суммы уменьшают базу налога на прибыль.
             </p>
           )}
         </div>

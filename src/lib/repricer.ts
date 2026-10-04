@@ -1,4 +1,5 @@
 import * as XLSX from "xlsx";
+import { splitBarcodes } from "./stockReport";
 
 export interface RepricerItem {
   id: string; // The SKU or Article
@@ -12,6 +13,9 @@ export interface RepricerItem {
   rowIndex: number; // to keep track of where to write back
   needsAttention?: boolean; // highlight if no index was found
   minPrice?: number | null; // promo floor to export ("Ограничение для акций и стратегий"); computed on the page
+  templateCogs: number | null; // COGS stored in Ozon ("Себестоимость", or "Новая себестоимость" if filled in)
+  newCogs?: number | null; // COGS to write back to Ozon ("Новая себестоимость"); computed on the page
+  barcodes: string[]; // "Штрихкод" — links the item to the accounting system's stock report
 }
 
 export interface ParsedTemplate {
@@ -31,6 +35,9 @@ export interface TemplateColumns {
   newPrice: number;
   newStrikePrice: number;
   newMinPrice: number;
+  cogs: number;
+  newCogs: number;
+  barcode: number;
   autoDisable: number[]; // "Подключать подходящие акции", "Автоматически добавлять товар в акции"
 }
 
@@ -46,6 +53,9 @@ const COLUMN_ALIASES = {
   newPrice: ["Новая предельная цена без акций", "Новая цена (со скидкой)"],
   newStrikePrice: ["Новая зачёркнутая цена", "Новая цена до скидки"],
   newMinPrice: ["Новое ограничение для акций и стратегий", "Новая минимальная цена"],
+  cogs: ["Себестоимость"],
+  newCogs: ["Новая себестоимость"],
+  barcode: ["Штрихкод"],
 } as const;
 
 function normalizeHeader(value: unknown): string {
@@ -90,6 +100,9 @@ export function resolveTemplateColumns(headers: unknown[]): TemplateColumns {
     newPrice: requireColumn(headers, COLUMN_ALIASES.newPrice),
     newStrikePrice: findColumn(headers, COLUMN_ALIASES.newStrikePrice),
     newMinPrice: findColumn(headers, COLUMN_ALIASES.newMinPrice),
+    cogs: findColumn(headers, COLUMN_ALIASES.cogs),
+    newCogs: findColumn(headers, COLUMN_ALIASES.newCogs),
+    barcode: findColumn(headers, COLUMN_ALIASES.barcode),
     autoDisable,
   };
 }
@@ -135,6 +148,9 @@ export async function parseOzonTemplate(file: File): Promise<ParsedTemplate> {
           newPrice: newPriceCol,
           priceIndex: priceIndexCol,
           customerPrice: customerPriceCol,
+          cogs: cogsCol,
+          newCogs: newCogsCol,
+          barcode: barcodeCol,
         } = columns;
 
         const items: RepricerItem[] = [];
@@ -177,6 +193,13 @@ export async function parseOzonTemplate(file: File): Promise<ParsedTemplate> {
             multiplier = oldPrice / currentPrice;
           }
 
+          // COGS kept in Ozon; "Новая себестоимость" wins if it was filled in before uploading
+          const readCogs = (col: number) => {
+            const value = col !== -1 ? parseFloat(String(row[col]).replace(",", ".")) : NaN;
+            return value > 0 ? value : null;
+          };
+          const templateCogs = readCogs(newCogsCol) ?? readCogs(cogsCol);
+
           items.push({
             id: String(article), // Use article as ID
             article: String(article),
@@ -187,6 +210,8 @@ export async function parseOzonTemplate(file: File): Promise<ParsedTemplate> {
             customerPrice,
             ozonDiscountPct,
             rowIndex: i,
+            templateCogs,
+            barcodes: barcodeCol !== -1 ? splitBarcodes(row[barcodeCol]) : [],
           });
         }
 
@@ -209,62 +234,46 @@ export async function parseOzonTemplate(file: File): Promise<ParsedTemplate> {
 
 export async function exportOzonTemplate(parsed: ParsedTemplate, updatedItems: RepricerItem[]): Promise<Blob> {
   const { workbook, sheetName } = parsed;
-  const sheet = workbook.Sheets[sheetName];
+  // Write into a copy of the sheet: the parsed workbook stays as Ozon sent it, so a value from a previous
+  // download (a price or COGS changed since) doesn't leak into the next one
+  const sheet: XLSX.WorkSheet = { ...workbook.Sheets[sheetName] };
+  const setCell = (c: number, r: number, t: "n" | "s", v: number | string) => {
+    const ref = XLSX.utils.encode_cell({ c, r });
+    sheet[ref] = { ...sheet[ref], t, v };
+  };
   const {
     newPrice: newPriceCol,
     newStrikePrice: newPriceNoDiscountCol,
     newMinPrice: minPriceCol,
+    newCogs: newCogsCol,
     autoDisable: autoDisableCols,
   } = parsed.columns;
 
   updatedItems.forEach((item) => {
+    // COGS goes back to Ozon independently of the price: Ozon keeps it, and the next template brings it along
+    if (newCogsCol !== -1 && item.newCogs != null) {
+      setCell(newCogsCol, item.rowIndex, "n", item.newCogs);
+    }
+
     if (item.newPrice !== null && item.newPrice !== undefined) {
-      const cellRefNewPrice = XLSX.utils.encode_cell({ c: newPriceCol, r: item.rowIndex });
-      
-      if (!sheet[cellRefNewPrice]) {
-         sheet[cellRefNewPrice] = { t: 'n', v: item.newPrice };
-      } else {
-         sheet[cellRefNewPrice].v = item.newPrice;
-         sheet[cellRefNewPrice].t = 'n';
-      }
+      setCell(newPriceCol, item.rowIndex, "n", item.newPrice);
 
       // Automatically calculate "price before discount" to always be greater
       if (newPriceNoDiscountCol !== -1) {
-          const autoOldPrice = Math.ceil(item.newPrice * item.multiplier);
-          const cellRefOld = XLSX.utils.encode_cell({ c: newPriceNoDiscountCol, r: item.rowIndex });
-          if (!sheet[cellRefOld]) {
-             sheet[cellRefOld] = { t: 'n', v: autoOldPrice };
-          } else {
-             sheet[cellRefOld].v = autoOldPrice;
-             sheet[cellRefOld].t = 'n';
-          }
+        setCell(newPriceNoDiscountCol, item.rowIndex, "n", Math.ceil(item.newPrice * item.multiplier));
       }
 
-      // Promo floor: the page passes a break-even based value; fall back to 50% of the new price
-      if (minPriceCol !== -1) {
-          const autoMinPrice = item.minPrice ?? Math.round(item.newPrice * 0.5);
-          const cellRefMin = XLSX.utils.encode_cell({ c: minPriceCol, r: item.rowIndex });
-          if (!sheet[cellRefMin]) {
-             sheet[cellRefMin] = { t: 'n', v: autoMinPrice };
-          } else {
-             sheet[cellRefMin].v = autoMinPrice;
-             sheet[cellRefMin].t = 'n';
-          }
+      // Promo floor: the page passes a break-even based value (the price itself when it's unknown).
+      // No blind fallback here: a 50% floor at Ozon's ~50% commission is a sure loss
+      if (minPriceCol !== -1 && item.minPrice != null) {
+        setCell(minPriceCol, item.rowIndex, "n", item.minPrice);
       }
 
       // Automatically disable auto-promos and auto-connections
-      autoDisableCols.forEach(colIdx => {
-          const cellRefAuto = XLSX.utils.encode_cell({ c: colIdx, r: item.rowIndex });
-          if (!sheet[cellRefAuto]) {
-             sheet[cellRefAuto] = { t: 's', v: 'НЕТ' };
-          } else {
-             sheet[cellRefAuto].v = 'НЕТ';
-             sheet[cellRefAuto].t = 's';
-          }
-      });
+      autoDisableCols.forEach((colIdx) => setCell(colIdx, item.rowIndex, "s", "НЕТ"));
     }
   });
 
-  const wbout = XLSX.write(workbook, { bookType: "xlsx", type: "array" });
+  const wbout = XLSX.write({ ...workbook, Sheets: { ...workbook.Sheets, [sheetName]: sheet } }, { bookType: "xlsx", type: "array" });
   return new Blob([wbout], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
 }

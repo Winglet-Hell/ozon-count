@@ -13,10 +13,13 @@ import type { CogsSuggestion } from "@/lib/cogsSuggest";
 export function CogsInput({
   value,
   suggestion,
+  pending,
   onCommit
 }: {
   value: number | undefined;
   suggestion?: CogsSuggestion;
+  /** Подсказка к синей точке: значение еще не в Ozon и уйдет туда при выгрузке */
+  pending?: string;
   onCommit: (value: number | null) => void;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
@@ -36,6 +39,10 @@ export function CogsInput({
 
   return (
     <div className="flex items-center justify-end gap-1">
+      <span
+        className={cn("w-1.5 h-1.5 rounded-full shrink-0", pending ? "bg-blue-500" : "bg-transparent")}
+        title={pending}
+      />
       <input
         type="text"
         inputMode="decimal"

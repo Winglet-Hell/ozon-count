@@ -70,6 +70,14 @@ const isRevenue = (group: string, type: string, amount: number) => {
   return g === "продажи" || (amount > 0 && (t.includes("выручка") || t.includes("баллы за скидки") || g.includes("баллы за скидки")));
 };
 
+/**
+ * Сколько «средних» единиц подмешиваем к истории артикула. У артикула с одной-двумя продажами метрики
+ * случайны: одна продажа, вернувшаяся назад, дает 100% возвратов и безубыточность в квинтиллионы рублей.
+ * Поэтому метрики артикула тянутся к средним магазина тем сильнее, чем меньше у него продаж:
+ * при 1 продаже своя история весит 1/6, при 50 — 91%, при 300 — 98%.
+ */
+const PRIOR_UNITS = 5;
+
 interface SkuTotals {
   revenue: number;
   pctCost: number;
@@ -127,7 +135,7 @@ export function buildSkuEconomics(accruals: AccrualsSummary): SkuEconomicsModel 
     else globalVatable -= amount;
   });
 
-  const bySku: Record<string, SkuMetrics> = {};
+  const withSales: [string, SkuTotals][] = [];
   const totals = emptyTotals();
   for (const [article, d] of Object.entries(perSku)) {
     if (d.quantity <= 0 || d.revenue <= 0) {
@@ -138,14 +146,7 @@ export function buildSkuEconomics(accruals: AccrualsSummary): SkuEconomicsModel 
       globalVatFree += d.pctVatFree + d.fixedVatFree;
       continue;
     }
-    bySku[article] = {
-      pct: d.pctCost / d.revenue,
-      pctVatFree: d.pctVatFree / d.revenue,
-      fixedVatable: d.fixedVatable / d.quantity,
-      fixedVatFree: d.fixedVatFree / d.quantity,
-      returnShare: Math.min(1, d.returned / d.quantity),
-      quantity: d.quantity
-    };
+    withSales.push([article, d]);
     totals.revenue += d.revenue;
     totals.pctCost += d.pctCost;
     totals.pctVatFree += d.pctVatFree;
@@ -158,16 +159,31 @@ export function buildSkuEconomics(accruals: AccrualsSummary): SkuEconomicsModel 
   if (globalVatable + globalVatFree < 0) { globalVatable = 0; globalVatFree = 0; }
   const perUnit = (value: number) => (totals.quantity > 0 ? value / totals.quantity : 0);
 
+  const average: SkuMetrics = {
+    pct: totals.revenue > 0 ? totals.pctCost / totals.revenue : 0,
+    pctVatFree: totals.revenue > 0 ? totals.pctVatFree / totals.revenue : 0,
+    fixedVatable: perUnit(totals.fixedVatable),
+    fixedVatFree: perUnit(totals.fixedVatFree),
+    returnShare: totals.quantity > 0 ? Math.min(1, totals.returned / totals.quantity) : 0,
+    quantity: 0
+  };
+
+  const bySku: Record<string, SkuMetrics> = {};
+  for (const [article, d] of withSales) {
+    const blend = (own: number, avg: number) => (own * d.quantity + avg * PRIOR_UNITS) / (d.quantity + PRIOR_UNITS);
+    bySku[article] = {
+      pct: blend(d.pctCost / d.revenue, average.pct),
+      pctVatFree: blend(d.pctVatFree / d.revenue, average.pctVatFree),
+      fixedVatable: blend(d.fixedVatable / d.quantity, average.fixedVatable),
+      fixedVatFree: blend(d.fixedVatFree / d.quantity, average.fixedVatFree),
+      returnShare: blend(Math.min(1, d.returned / d.quantity), average.returnShare),
+      quantity: d.quantity
+    };
+  }
+
   return {
     bySku,
-    average: {
-      pct: totals.revenue > 0 ? totals.pctCost / totals.revenue : 0,
-      pctVatFree: totals.revenue > 0 ? totals.pctVatFree / totals.revenue : 0,
-      fixedVatable: perUnit(totals.fixedVatable),
-      fixedVatFree: perUnit(totals.fixedVatFree),
-      returnShare: totals.quantity > 0 ? Math.min(1, totals.returned / totals.quantity) : 0,
-      quantity: 0
-    },
+    average,
     globalFixed: { vatable: perUnit(globalVatable), vatFree: perUnit(globalVatFree) }
   };
 }
@@ -216,6 +232,7 @@ export function breakEvenOf(econ: UnitEconomics, tax: TaxSettings): number | nul
   const r = vatFraction(tax.vatRate);
   const cogsVat = tax.cogsVatShare / 100;
   const numerator = econ.fixedVatable * (1 - r) + econ.fixedVatFree + econ.cogs * (1 - r * cogsVat);
+  // Доля цены, что остается после процентных расходов и НДС. Меньше процента — цены безубыточности нет
   const denominator = (1 - r) * (1 - econ.pct) - r * econ.pctVatFree;
-  return denominator > 0 ? numerator / denominator : null;
+  return denominator > 0.01 ? numerator / denominator : null;
 }

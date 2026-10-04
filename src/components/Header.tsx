@@ -8,13 +8,14 @@ import { usePathname } from "next/navigation";
 interface HeaderProps {
     onUploadClick?: () => void;
     showUploadButton?: boolean;
+    uploadLabel?: string;
     period?: string;
     activeTab?: "dashboard" | "articles" | "repricer" | "accruals" | string;
     onTabChange?: (tab: "dashboard" | "articles" | string) => void;
     children?: React.ReactNode;
 }
 
-export function Header({ onUploadClick, showUploadButton, period, activeTab, onTabChange, children }: HeaderProps) {
+export function Header({ onUploadClick, showUploadButton, uploadLabel = "Загрузить отчет", period, activeTab, onTabChange, children }: HeaderProps) {
     const pathname = usePathname();
 
     return (
@@ -76,7 +77,7 @@ export function Header({ onUploadClick, showUploadButton, period, activeTab, onT
                             className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-slate-600 bg-transparent border border-transparent hover:bg-slate-100 hover:text-slate-900 rounded-lg transition-all"
                         >
                             <Upload className="w-3.5 h-3.5" />
-                            Загрузить отчет
+                            {uploadLabel}
                         </button>
                     )}
                 </div>

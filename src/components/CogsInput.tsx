@@ -14,13 +14,19 @@ export function CogsInput({
   value,
   suggestion,
   pending,
-  onCommit
+  onCommit,
+  onDraft
 }: {
   value: number | undefined;
   suggestion?: CogsSuggestion;
   /** Подсказка к синей точке: значение еще не в Ozon и уйдет туда при выгрузке */
   pending?: string;
   onCommit: (value: number | null) => void;
+  /**
+   * Что вписано, но еще не применено: число, null — поле очищено, undefined — применять нечего.
+   * Страница применяет это сама перед выгрузкой: в Safari и Firefox клик по кнопке не уводит фокус с поля
+   */
+  onDraft?: (value: number | null | undefined) => void;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
   const isEmpty = value === undefined;
@@ -28,6 +34,7 @@ export function CogsInput({
   const commit = () => {
     if (draft === null) return;
     setDraft(null);
+    onDraft?.(undefined);
     const text = draft.trim().replace(/\s/g, "").replace(",", ".");
     if (text === "") {
       if (!isEmpty) onCommit(null);
@@ -53,11 +60,19 @@ export function CogsInput({
           setDraft(isEmpty ? "" : String(value));
           e.target.select();
         }}
-        onChange={(e) => setDraft(e.target.value)}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          const text = e.target.value.trim().replace(/\s/g, "").replace(",", ".");
+          const next = parseFloat(text);
+          onDraft?.(text === "" ? (isEmpty ? undefined : null) : next > 0 && next !== value ? next : undefined);
+        }}
         onBlur={commit}
         onKeyDown={(e) => {
           if (e.key === "Enter") e.currentTarget.blur();
-          if (e.key === "Escape") setDraft(null);
+          if (e.key === "Escape") {
+            setDraft(null);
+            onDraft?.(undefined);
+          }
         }}
         className={cn(
           "w-20 px-2 py-1.5 border rounded-lg text-sm font-medium text-right focus:outline-none focus:ring-2 transition-all",

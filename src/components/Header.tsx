@@ -27,11 +27,11 @@ export function Header({ onUploadClick, showUploadButton, uploadLabel = "Заг�
                     </div>
                     <div className="h-4 w-px bg-slate-200 mx-1" />
                     <div className="flex items-center gap-3">
-                        <h1 className="text-lg font-semibold text-slate-900 tracking-tight">
+                        <h1 className="text-lg font-semibold text-slate-900 tracking-tight whitespace-nowrap">
                             Ozon Count
                         </h1>
                         {period && (
-                            <span className="text-xs text-slate-400 font-medium hidden lg:inline px-2 py-1">
+                            <span className="text-xs text-slate-400 font-medium hidden xl:inline whitespace-nowrap px-2 py-1">
                                 {period.replace('Период: ', '')}
                             </span>
                         )}
@@ -74,7 +74,7 @@ export function Header({ onUploadClick, showUploadButton, uploadLabel = "Заг�
                     {showUploadButton && onUploadClick && (
                         <button
                             onClick={onUploadClick}
-                            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-slate-600 bg-transparent border border-transparent hover:bg-slate-100 hover:text-slate-900 rounded-lg transition-all"
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold text-slate-600 bg-transparent border border-transparent hover:bg-slate-100 hover:text-slate-900 rounded-lg transition-all whitespace-nowrap"
                         >
                             <Upload className="w-3.5 h-3.5" />
                             {uploadLabel}

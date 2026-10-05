@@ -4,11 +4,12 @@ import { createContext, useCallback, useContext, useMemo, useState, useSyncExter
 import { AccrualsSummary } from "@/lib/parseAccruals";
 import { ParsedTemplate, RepricerItem } from "@/lib/repricer";
 import { DEFAULT_VAT_RATE, DEFAULT_COGS_VAT_SHARE, DEFAULT_INCOME_TAX_RATE } from "@/lib/vat";
-import { cogsEditsStore, ozonCogsStore } from "@/lib/cogsStores";
+import { accrualsReportStore, cogsEditsStore, ozonCogsStore } from "@/lib/persistentStores";
 
 interface AppState {
+  /** Последний загруженный отчет о начислениях. Хранится в браузере */
   accrualsResult: AccrualsSummary | null;
-  setAccrualsResult: React.Dispatch<React.SetStateAction<AccrualsSummary | null>>;
+  setAccrualsResult: (report: AccrualsSummary | null) => void;
 
   repricerParsedData: ParsedTemplate | null;
   setRepricerParsedData: React.Dispatch<React.SetStateAction<ParsedTemplate | null>>;
@@ -32,6 +33,8 @@ interface AppState {
   setCogsEdits: (edits: Record<string, number | null>) => void;
   /** Себестоимость из свежего шаблона Ozon; правки, которые Ozon уже сохранил, больше не нужны */
   mergeTemplateCogs: (templateCogs: Record<string, number>) => void;
+  /** Себестоимость прямо сейчас, с правками, примененными в этом же обработчике, — skuCogs обновится только после перерисовки */
+  getCurrentCogs: () => Record<string, number>;
 
   cogsFileName: string | null;
   setCogsFileName: React.Dispatch<React.SetStateAction<string | null>>;
@@ -52,7 +55,8 @@ interface AppState {
 const AppStateContext = createContext<AppState | undefined>(undefined);
 
 export function AppStateProvider({ children }: { children: React.ReactNode }) {
-  const [accrualsResult, setAccrualsResult] = useState<AccrualsSummary | null>(null);
+  const accrualsResult = useSyncExternalStore(accrualsReportStore.subscribe, accrualsReportStore.getSnapshot, accrualsReportStore.getServerSnapshot);
+  const setAccrualsResult = accrualsReportStore.set;
   const [repricerParsedData, setRepricerParsedData] = useState<ParsedTemplate | null>(null);
   const [repricerItems, setRepricerItems] = useState<RepricerItem[]>([]);
   const [fileCogs, setFileCogs] = useState<Record<string, number>>({});
@@ -83,6 +87,11 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
 
   const skuCogs = useMemo(() => ({ ...fileCogs, ...ozonCogs, ...cogsEdits }), [fileCogs, ozonCogs, cogsEdits]);
 
+  const getCurrentCogs = useCallback(
+    () => ({ ...fileCogs, ...ozonCogsStore.getSnapshot(), ...cogsEditsStore.getSnapshot() }),
+    [fileCogs]
+  );
+
   return (
     <AppStateContext.Provider value={{
       accrualsResult, setAccrualsResult,
@@ -91,7 +100,7 @@ export function AppStateProvider({ children }: { children: React.ReactNode }) {
       skuCogs,
       fileCogs, setFileCogs,
       ozonCogs,
-      cogsEdits, setCogsEdits, mergeTemplateCogs,
+      cogsEdits, setCogsEdits, mergeTemplateCogs, getCurrentCogs,
       cogsFileName, setCogsFileName,
       vatRate, setVatRate,
       cogsVatShare, setCogsVatShare,

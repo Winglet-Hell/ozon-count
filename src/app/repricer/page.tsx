@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useRef } from "react";
 import { Loader2, FileSpreadsheet, Download, RefreshCw, TrendingUp, Plus, Minus, AlertTriangle, Coins, ListChecks, Search, ArrowUp, ArrowDown, X } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Header } from "@/components/Header";
@@ -94,6 +94,9 @@ export default function RepricerPage() {
   const [error, setError] = useState<string | null>(null);
   const [bulkPct, setBulkPct] = useState("10");
   const [stockSync, setStockSync] = useState<(StockSync & { createdAt: string | null }) | null>(null);
+  const [lastDownload, setLastDownload] = useState<{ fileName: string; prices: number; cogs: number } | null>(null);
+  // COGS typed into a field but not committed yet (it commits on Enter or leaving the field)
+  const cogsDrafts = useRef<Record<string, number | null>>({});
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: "article", dir: 1 });
@@ -106,6 +109,7 @@ export default function RepricerPage() {
     accrualsResult,
     skuCogs,
     setCogsEdits,
+    getCurrentCogs,
     mergeTemplateCogs,
     vatRate,
     cogsVatShare,
@@ -196,10 +200,10 @@ export default function RepricerPage() {
     [items, skuCogs]
   );
 
-  const rows = useMemo<Row[]>(() => items.map(item => {
+  // One table row from an item and its COGS. The download reuses it with the store's latest COGS
+  const computeRow = useCallback((item: RepricerItem, cogs: number): Row => {
     const price = item.newPrice ?? item.currentPrice;
-    const cogs = skuCogs[item.article] || 0;
-    const econ = unitEconomics(item.article);
+    const econ = economicsModel ? skuUnitEconomics(economicsModel, item.article, cogs) : null;
     const profit = econ ? profitAt(econ, price, taxSettings) : null;
 
     // Prefer the template discount: it's a fresh snapshot of what the buyer pays right now,
@@ -222,7 +226,9 @@ export default function RepricerPage() {
       discountSource: useTemplateDiscount ? "по шаблону" : "по отчету",
       customerPrice: price * (1 - discount)
     };
-  }), [items, skuCogs, unitEconomics, taxSettings, accrualsDiscountMap, minPriceFor]);
+  }, [economicsModel, taxSettings, accrualsDiscountMap, minPriceFor]);
+
+  const rows = useMemo(() => items.map(item => computeRow(item, skuCogs[item.article] || 0)), [items, skuCogs, computeRow]);
 
   const filterCounts = useMemo(() => {
     const counts: Record<Filter, number> = { all: 0, noCogs: 0, loss: 0, changed: 0, toOzon: 0 };
@@ -303,6 +309,7 @@ export default function RepricerPage() {
     setItems([]);
     setError(null);
     setStockSync(null);
+    setLastDownload(null);
     setQuery("");
     setFilter("all");
   };
@@ -419,20 +426,34 @@ export default function RepricerPage() {
 
   const handleDownload = async () => {
     if (!parsedData) return;
+    // A COGS still being typed hasn't been committed: Safari and Firefox don't take focus from a field when
+    // a button is clicked, so it never blurs. Commit such drafts and build the file from the store's latest
+    // values — the rows of this render predate the commit
+    const drafts = cogsDrafts.current;
+    cogsDrafts.current = {};
+    if (Object.keys(drafts).length > 0) setCogsEdits(drafts);
+    const cogsNow = getCurrentCogs();
+    const exportRows = items.map(item => computeRow(item, cogsNow[item.article] || 0));
     try {
       setIsProcessing(true);
       const blob = await exportOzonTemplate(
         parsedData,
-        rows.map(row => ({ ...row.item, minPrice: row.min.value, newCogs: row.toOzon }))
+        exportRows.map(row => ({ ...row.item, minPrice: row.min.value, newCogs: row.toOzon }))
       );
+      const fileName = `Обновленные_цены_${new Date().toLocaleDateString("ru-RU")}.xlsx`;
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = `Обновленные_цены_${new Date().toLocaleDateString("ru-RU")}.xlsx`;
+      a.download = fileName;
       document.body.appendChild(a);
       a.click();
       window.URL.revokeObjectURL(url);
       document.body.removeChild(a);
+      setLastDownload({
+        fileName,
+        prices: exportRows.filter(row => row.item.newPrice !== null).length,
+        cogs: exportRows.filter(row => row.toOzon !== null).length
+      });
     } catch (err) {
       console.error(err);
       setError("Ошибка при сохранении файла");
@@ -666,6 +687,24 @@ export default function RepricerPage() {
             </div>
           </div>
 
+          {lastDownload && (
+            <div className="shrink-0 flex items-start justify-between gap-4 px-4 sm:px-5 py-3 bg-emerald-50/70 border border-emerald-100 rounded-2xl text-sm text-slate-700">
+              <div>
+                <span className="font-bold text-slate-900">Файл «{lastDownload.fileName}» сохранен.</span>{" "}
+                В нем новые цены — {lastDownload.prices} (колонка «Новая предельная цена без акций»)
+                {" "}и себестоимость — {lastDownload.cogs} (колонка «Новая себестоимость», в конце таблицы; колонка
+                «Себестоимость» показывает то, что в Ozon сейчас).
+              </div>
+              <button
+                onClick={() => setLastDownload(null)}
+                className="shrink-0 p-1 text-slate-400 hover:text-slate-700 rounded-md hover:bg-emerald-100 transition-colors"
+                aria-label="Скрыть"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
           {stockSync && (
             <div className="shrink-0 flex items-start justify-between gap-4 px-4 sm:px-5 py-3 bg-blue-50/60 border border-blue-100 rounded-2xl text-sm text-slate-700">
               <div className="space-y-1">
@@ -835,6 +874,10 @@ export default function RepricerPage() {
                             ? `В Ozon сейчас ${NUM0.format(item.templateCogs)} ₽ — при выгрузке запишется ${NUM0.format(row.toOzon)} ₽`
                             : "В Ozon себестоимости нет — при выгрузке запишется это значение"}
                           onCommit={(value) => setCogsEdits({ [item.article]: value })}
+                          onDraft={(value) => {
+                            if (value === undefined) delete cogsDrafts.current[item.article];
+                            else cogsDrafts.current[item.article] = value;
+                          }}
                         />
                       </td>
                       <td className="px-2.5 py-1.5 text-right">

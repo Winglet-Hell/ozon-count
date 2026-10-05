@@ -9,6 +9,12 @@ export interface AccrualsBreakdownItem {
   pctOfTotalInflowForOutflow: number;
 }
 
+/**
+ * Начисления по артикулу, сложенные по группе, типу и знаку суммы. Расчетам нужны только суммы,
+ * а 362 тыс. строк отчета за месяц сворачиваются в несколько тысяч — страница пересчитывается
+ * мгновенно, и отчет помещается в хранилище браузера. Знак держим отдельно: строка выручки
+ * с минусом — сторно продажи, и ее количество вычитается из проданного.
+ */
 export interface SkuTransaction {
   sku: string;
   group: string;
@@ -210,7 +216,7 @@ export const parseAccrualsReport = async (file: File): Promise<AccrualsSummary> 
   let totalInflow = 0;
   let totalOutflow = 0;
   const breakdownMap: Record<string, number> = {};
-  const skuTransactions: SkuTransaction[] = [];
+  const skuTotals = new Map<string, SkuTransaction>();
   const decode = cachedDecoder();
 
   await streamSheetRows(sheetFile, (rowXml) => {
@@ -259,13 +265,14 @@ export const parseAccrualsReport = async (file: File): Promise<AccrualsSummary> 
     }
 
     if (sku) {
-      skuTransactions.push({
-        sku,
-        group: grp,
-        type: typ,
-        quantity: qty,
-        amount
-      });
+      const key = `${sku}\u0001${grp}\u0001${typ}\u0001${amount < 0 ? "-" : "+"}`;
+      const total = skuTotals.get(key);
+      if (total) {
+        total.quantity += qty;
+        total.amount += amount;
+      } else {
+        skuTotals.set(key, { sku, group: grp, type: typ, quantity: qty, amount });
+      }
     }
   });
 
@@ -308,7 +315,7 @@ export const parseAccrualsReport = async (file: File): Promise<AccrualsSummary> 
     totalOutflow,
     netResult: totalInflow + totalOutflow,
     breakdown,
-    skuTransactions
+    skuTransactions: Array.from(skuTotals.values())
   };
 };
 

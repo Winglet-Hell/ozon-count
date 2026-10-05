@@ -1,12 +1,13 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
-import { Upload, Loader2, Coins, TrendingUp, TrendingDown, ReceiptText, ArrowRightLeft, FileSpreadsheet, Info, Percent, AlertTriangle, Check, FileDown, Landmark, ChevronDown } from "lucide-react";
+import { useState, useCallback, useEffect, useMemo } from "react";
+import { Upload, Loader2, TrendingUp, FileSpreadsheet, Info, AlertTriangle, Check, ChevronDown, Coins } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Header } from "@/components/Header";
 import { parseAccrualsReport, parseCogsCsv, parseCogsXlsx, fetchArchivedCogs, loadDefaultCogs, type AccrualsBreakdownItem } from "@/lib/parseAccruals";
 import { computeVat, splitFlowForVat, isVatFree, vatFraction, type VatResult } from "@/lib/vat";
 import { suggestCogs } from "@/lib/cogsSuggest";
+import { buildCategoryEconomics, getCategoryFromArticle, type CategoryEconomics } from "@/lib/categoryEconomics";
 import { cn } from "@/lib/utils";
 import { CogsInput } from "@/components/CogsInput";
 
@@ -30,16 +31,15 @@ const formatCurrency = (val: number, compact: boolean = false): string => {
   }).format(val);
 };
 
-const getCategoryFromArticle = (article: string): string => {
-  const artLower = article.toLowerCase();
-  if (artLower.includes("тапоч") || artLower.includes("тапок")) return "Тапочки";
-  if (artLower.includes("жилет")) return "Жилеты";
-  if (artLower.includes("рубашк")) return "Рубашки";
-  if (artLower.includes("носк")) return "Носки";
-  // Новые виды товара — по первому слову после артикула: «6-835-4/1-38-39. Чуни темно-бежевые»
-  const kind = article.match(/\.\s+([А-Яа-яЁёA-Za-z]+)/)?.[1];
-  return kind ? kind[0].toUpperCase() + kind.slice(1).toLowerCase() : "Прочее";
-};
+const RUB0 = new Intl.NumberFormat("ru-RU", { style: "currency", currency: "RUB", maximumFractionDigits: 0 });
+const NUM0 = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 });
+const NUM1 = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+const NUM2 = new Intl.NumberFormat("ru-RU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+/** Проценты в русском формате: «2,04%», а не «2.04%». Крошечные значения — с двумя знаками, чтобы не было «−0,0%» */
+const formatPct = (value: number, digits: 1 | 2 = 1) =>
+  `${(digits === 2 || (value !== 0 && Math.abs(value) < 0.05) ? NUM2 : NUM1).format(value)}%`;
+/** Доля строки в таблице: крошечные статьи показываем как «<0,1%», а не «0,0%» */
+const formatShare = (value: number) => (value > 0 && value < 0.05 ? "<0,1%" : formatPct(value));
 
 const isSalesGroup = (group: string) => group.toLowerCase().includes("продажи");
 const isReturnsGroup = (group: string) => group.toLowerCase().includes("возвраты");
@@ -261,7 +261,6 @@ export default function AccrualsPage() {
     .filter(cat => cat.sold > 0 || cat.returned > 0)
     .sort((a, b) => b.net - a.net);
 
-  const totalNetItems = activeCategories.reduce((sum, cat) => sum + cat.net, 0);
 
   // Calculate actual base sums for Ozon commission and logistics
   let actualCommissionSum = 0;
@@ -280,7 +279,6 @@ export default function AccrualsPage() {
   const actualTotalInflow = result ? result.totalInflow : 0;
   const actualTotalOutflow = result ? result.totalOutflow : 0;
   const actualNetResult = result ? result.netResult : 0;
-  const actualOzonMargin = actualTotalInflow > 0 ? (actualNetResult / actualTotalInflow) * 100 : 0;
 
   // Actual rates relative to inflow
   const actualCommissionRate = actualTotalInflow > 0 ? (actualCommissionSum / actualTotalInflow) * 100 : 0;
@@ -603,8 +601,6 @@ export default function AccrualsPage() {
     0
   );
 
-  const pctOfSales = (value: number): string | undefined =>
-    salesBase ? `${((value / salesBase) * 100).toFixed(1)}% от продаж` : undefined;
 
   const adjustedMargin = salesBase ? (adjustedNetResult / salesBase) * 100 : 0;
   const actualRealMargin = actualSalesBase ? (actualRealNetResult / actualSalesBase) * 100 : 0;
@@ -666,7 +662,35 @@ export default function AccrualsPage() {
       })
     : [];
 
+  // Итог периода одной строкой: от продаж до чистой прибыли. В моделировании рядом — факт для сравнения
+  const resultSteps: ResultStep[] = [
+    { label: "Продажи", value: salesBase, actual: actualSalesBase, hint: "Выручка, баллы за скидки и программы партнеров — с НДС, до возвратов" },
+    { label: "Списания Ozon", sign: "−", value: ozonSpend, actual: actualSalesBase - actualNetResult, cost: true, hint: "Комиссия, логистика, реклама, возвраты и остальные услуги" },
+    { label: "К выплате", sign: "=", value: adjustedNetResultFromFlows, actual: actualNetResult, hint: "Что Ozon перечисляет за период" },
+    { label: "Себестоимость", sign: "−", value: totalProductionCogs, actual: actualProductionCogs, cost: true, hint: "Производство проданного товара за вычетом вернувшихся на склад" },
+    {
+      label: vat.vatPayable < 0 ? "НДС к возмещению" : "НДС к уплате",
+      sign: "−",
+      value: vat.vatPayable,
+      actual: actualVat.vatPayable,
+      cost: true,
+      hint: `Ставка ${vatRate}%: исчисленный с продаж минус вычеты по услугам Ozon и себестоимости`
+    },
+    {
+      label: "Налог на прибыль",
+      sign: "−",
+      value: taxAmount,
+      actual: actualTaxAmount,
+      cost: true,
+      hint: `${incomeTaxRate}% с прибыли до налога. Посчитан за период, без убытков прошлых периодов и расходов вне Ozon`
+    }
+  ];
 
+  // Прибыль по видам товара — по факту периода, та же модель, что итог страницы
+  const categoryEconomics = useMemo(
+    () => (result ? buildCategoryEconomics(result, skuCogs, { vatRate, cogsVatShare, incomeTaxRate }) : []),
+    [result, skuCogs, vatRate, cogsVatShare, incomeTaxRate]
+  );
 
   return (
     <main className="min-h-screen bg-slate-50/50 flex flex-col selection:bg-blue-500/20">
@@ -689,7 +713,7 @@ export default function AccrualsPage() {
               ) : (
                 <Upload className="w-3.5 h-3.5" />
               )}
-              <span className="hidden xl:inline">Себестоимость</span>
+              <span className="hidden lg:inline">Себестоимость</span>
             </button>
             <input
               id="csv-file-upload-active"
@@ -713,7 +737,7 @@ export default function AccrualsPage() {
               )}
             >
               <TrendingUp className="w-3.5 h-3.5" />
-              <span className="hidden xl:inline">Моделирование</span>
+              <span className="hidden lg:inline">Моделирование</span>
             </button>
           </div>
         )}
@@ -886,6 +910,28 @@ export default function AccrualsPage() {
                           </h3>
                         </div>
 
+                        {/* Результат модели рядом с ползунками: итог страницы при этом может быть вне экрана */}
+                        <div className="sticky -top-6 sm:-top-8 z-10 -mx-1 px-1 py-2 bg-white">
+                          <div className="grid grid-cols-2 gap-3 rounded-2xl bg-slate-50 border border-slate-100 p-4">
+                            <div>
+                              <div className="text-xs font-semibold text-slate-500">Чистая прибыль</div>
+                              <div className={cn("text-lg font-extrabold tabular-nums", adjustedNetResult >= 0 ? "text-emerald-700" : "text-rose-700")}>
+                                {RUB0.format(adjustedNetResult)}
+                              </div>
+                              <div className={cn("text-[11px] font-semibold tabular-nums", adjustedNetResult >= actualRealNetResult ? "text-emerald-600" : "text-rose-600")}>
+                                {adjustedNetResult >= actualRealNetResult ? "+" : "−"}{NUM0.format(Math.abs(adjustedNetResult - actualRealNetResult))} ₽ к факту
+                              </div>
+                            </div>
+                            <div>
+                              <div className="text-xs font-semibold text-slate-500">Маржа</div>
+                              <div className={cn("text-lg font-extrabold tabular-nums", adjustedMargin >= 0 ? "text-emerald-700" : "text-rose-700")}>
+                                {formatPct(adjustedMargin, 2)}
+                              </div>
+                              <div className="text-[11px] font-semibold text-slate-500 tabular-nums">факт: {formatPct(actualRealMargin, 2)}</div>
+                            </div>
+                          </div>
+                        </div>
+
                         <div className="space-y-6">
                           {/* Commission Slider */}
                           <div className="space-y-4">
@@ -897,11 +943,11 @@ export default function AccrualsPage() {
                                     "text-xs font-bold px-1.5 py-0.5 rounded-md",
                                     commissionRate > actualCommissionRate ? "bg-rose-50 text-rose-600" : "bg-emerald-50 text-emerald-600"
                                   )}>
-                                    {commissionRate > actualCommissionRate ? "+" : ""}{(commissionRate - actualCommissionRate).toFixed(1)}%
+                                    {commissionRate > actualCommissionRate ? "+" : ""}{formatPct(commissionRate - actualCommissionRate)}
                                   </span>
                                 )}
                                 <span className="text-sm font-extrabold text-slate-900 bg-slate-100 px-2 py-1 rounded-lg">
-                                  {(commissionRate ?? actualCommissionRate).toFixed(1)}%
+                                  {formatPct(commissionRate ?? actualCommissionRate)}
                                 </span>
                               </div>
                             </div>
@@ -916,7 +962,7 @@ export default function AccrualsPage() {
                             />
                             <div className="flex justify-between text-xs font-semibold text-slate-400">
                               <span>{Math.max(0, Math.floor(actualCommissionRate - 15))}%</span>
-                              <span>Факт: {actualCommissionRate.toFixed(1)}%</span>
+                              <span>Факт: {formatPct(actualCommissionRate)}</span>
                               <span>{Math.ceil(actualCommissionRate + 20)}%</span>
                             </div>
                           </div>
@@ -931,11 +977,11 @@ export default function AccrualsPage() {
                                     "text-xs font-bold px-1.5 py-0.5 rounded-md",
                                     logisticsRate > actualLogisticsRate ? "bg-rose-50 text-rose-600" : "bg-emerald-50 text-emerald-600"
                                   )}>
-                                    {logisticsRate > actualLogisticsRate ? "+" : ""}{(logisticsRate - actualLogisticsRate).toFixed(1)}%
+                                    {logisticsRate > actualLogisticsRate ? "+" : ""}{formatPct(logisticsRate - actualLogisticsRate)}
                                   </span>
                                 )}
                                 <span className="text-sm font-extrabold text-slate-900 bg-slate-100 px-2 py-1 rounded-lg">
-                                  {(logisticsRate ?? actualLogisticsRate).toFixed(1)}%
+                                  {formatPct(logisticsRate ?? actualLogisticsRate)}
                                 </span>
                               </div>
                             </div>
@@ -950,7 +996,7 @@ export default function AccrualsPage() {
                             />
                             <div className="flex justify-between text-xs font-semibold text-slate-400">
                               <span>{Math.max(0, Math.floor(actualLogisticsRate - 15))}%</span>
-                              <span>Факт: {actualLogisticsRate.toFixed(1)}%</span>
+                              <span>Факт: {formatPct(actualLogisticsRate)}</span>
                               <span>{Math.ceil(actualLogisticsRate + 20)}%</span>
                             </div>
                           </div>
@@ -965,11 +1011,11 @@ export default function AccrualsPage() {
                                     "text-xs font-bold px-1.5 py-0.5 rounded-md",
                                     cogsRate > actualCogsRate ? "bg-rose-50 text-rose-600" : "bg-emerald-50 text-emerald-600"
                                   )}>
-                                    {cogsRate > actualCogsRate ? "+" : ""}{(cogsRate - actualCogsRate).toFixed(1)}%
+                                    {cogsRate > actualCogsRate ? "+" : ""}{formatPct(cogsRate - actualCogsRate)}
                                   </span>
                                 )}
                                 <span className="text-sm font-extrabold text-slate-900 bg-slate-100 px-2 py-1 rounded-lg">
-                                  {(cogsRate ?? actualCogsRate).toFixed(1)}%
+                                  {formatPct(cogsRate ?? actualCogsRate)}
                                 </span>
                               </div>
                             </div>
@@ -984,7 +1030,7 @@ export default function AccrualsPage() {
                             />
                             <div className="flex justify-between text-xs font-semibold text-slate-400">
                               <span>{actualCogsRate > 0 ? Math.max(0, Math.floor(actualCogsRate - 15)) : 0}%</span>
-                              <span>Факт: {actualCogsRate.toFixed(1)}%</span>
+                              <span>Факт: {formatPct(actualCogsRate)}</span>
                               <span>{actualCogsRate > 0 ? Math.ceil(actualCogsRate + 20) : 50}%</span>
                             </div>
                           </div>
@@ -1004,7 +1050,7 @@ export default function AccrualsPage() {
                                       <div className="flex items-center gap-2">
                                         <label className="text-sm font-bold text-slate-700">{cat.name}</label>
                                         <span className="text-xs font-semibold text-slate-400">
-                                          ({Math.round(cat.net * currentGrowth)} шт.)
+                                          ({NUM0.format(cat.net * currentGrowth)} шт.)
                                         </span>
                                       </div>
                                       <div className="flex items-center gap-1.5">
@@ -1111,114 +1157,29 @@ export default function AccrualsPage() {
                   </div>
                 )}
 
-                {/* Summary Metrics Section - Row 1 (Ozon Cash Flow) */}
-                <div className="space-y-6">
-                  <div className="space-y-2">
-                    <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">Финансовый поток Ozon</h3>
-                    <p className="text-sm text-slate-500 flex items-start gap-2 max-w-3xl">
-                      <Info className="w-4 h-4 shrink-0 mt-0.5 text-slate-400" />
-                      <span>
-                        Расчеты с Ozon — суммы с НДС, как в отчете: площадка и платит выручку, и удерживает услуги брутто.
-                        НДС — это расчеты с бюджетом, он посчитан ниже, в «Реальной экономике».
-                      </span>
-                    </p>
-                  </div>
-                  <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
-                    <SummaryCard
-                      title="Поступило денег"
-                      value={adjustedTotalInflow}
-                      originalValue={actualTotalInflow}
-                      isForecastActive={isForecastMode}
-                      icon={<TrendingUp className="w-6 h-6 text-emerald-500" />}
-                    />
-                    <SummaryCard
-                      title="Списано (Услуги)"
-                      value={adjustedTotalOutflow}
-                      originalValue={actualTotalOutflow}
-                      isForecastActive={isForecastMode}
-                      icon={<TrendingDown className="w-6 h-6 text-rose-500" />}
-                      subText={adjustedTotalInflow ? `${(Math.abs(adjustedTotalOutflow) / adjustedTotalInflow * 100).toFixed(1)}% от прихода` : undefined}
-                    />
-                    <SummaryCard
-                      title="К выплате"
-                      value={adjustedNetResultFromFlows}
-                      originalValue={actualNetResult}
-                      isForecastActive={isForecastMode}
-                      icon={<Coins className="w-6 h-6 text-blue-500" />}
-                      highlight
-                    />
-                    <SummaryCard
-                      title="Маржинальность"
-                      value={adjustedTotalInflow ? (adjustedNetResultFromFlows / adjustedTotalInflow) * 100 : 0}
-                      originalValue={actualOzonMargin}
-                      isForecastActive={isForecastMode}
-                      icon={<Percent className="w-6 h-6 text-indigo-500" />}
-                      isPercent
-                    />
-                  </div>
-                </div>
+                {/* Итог периода: от продаж до чистой прибыли */}
+                <div className="space-y-3">
+                  <ResultStrip
+                    steps={resultSteps}
+                    base={salesBase}
+                    profit={adjustedNetResult}
+                    actualProfit={actualRealNetResult}
+                    margin={adjustedMargin}
+                    actualMargin={actualRealMargin}
+                    isForecast={isForecastMode}
+                  />
 
-                {/* Summary Metrics Section - Row 2 (Real Economy) */}
-                <div className="space-y-6 pt-4">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">Реальная экономика</h3>
-                  </div>
-                  <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5">
-                    <SummaryCard
-                      title="Себестоимость"
-                      value={totalProductionCogs}
-                      originalValue={actualProductionCogs}
-                      isForecastActive={isForecastMode}
-                      inverseDifference
-                      icon={<ReceiptText className="w-6 h-6 text-amber-500" />}
-                      subText={pctOfSales(totalProductionCogs)}
-                    />
-                    <SummaryCard
-                      title={vat.vatPayable < 0 ? `НДС к возмещению (${vatRate}%)` : `НДС к уплате (${vatRate}%)`}
-                      value={Math.abs(vat.vatPayable)}
-                      originalValue={Math.abs(actualVat.vatPayable)}
-                      isForecastActive={isForecastMode}
-                      inverseDifference={vat.vatPayable >= 0}
-                      icon={<Landmark className="w-6 h-6 text-sky-500" />}
-                      subText={pctOfSales(vat.vatPayable)}
-                    />
-                    <SummaryCard
-                      title={`Налог на прибыль (${incomeTaxRate}%)`}
-                      value={taxAmount}
-                      originalValue={actualTaxAmount}
-                      isForecastActive={isForecastMode}
-                      inverseDifference
-                      icon={<FileDown className="w-6 h-6 text-orange-500" />}
-                      subText={taxableProfit > 0 ? pctOfSales(taxAmount) : "Нет прибыли"}
-                    />
-                    <SummaryCard
-                      title="Чистая прибыль"
-                      value={adjustedNetResult}
-                      originalValue={actualRealNetResult}
-                      isForecastActive={isForecastMode}
-                      icon={<Coins className="w-6 h-6 text-violet-500" />}
-                      highlight
-                    />
-                    <SummaryCard
-                      title="Итоговая маржа"
-                      value={adjustedMargin}
-                      originalValue={actualRealMargin}
-                      isForecastActive={isForecastMode}
-                      icon={<Percent className="w-6 h-6 text-fuchsia-500" />}
-                      isPercent
-                      subText="от продаж с НДС"
-                    />
-                  </div>
-
-                  <p className="text-sm text-slate-500 flex items-start gap-2 max-w-4xl">
-                    <Info className="w-4 h-4 shrink-0 mt-0.5 text-slate-400" />
+                  <p className="text-xs text-slate-400 flex items-start gap-1.5 max-w-5xl">
+                    <Info className="w-3.5 h-3.5 shrink-0 mt-px" />
                     <span>
-                      Налог на прибыль посчитан за период, а не нарастающим итогом с начала года,
-                      и накопленный убыток прошлых периодов не переносится. Плюс в базе нет расходов
-                      вне Ozon — зарплаты, аренды, бухгалтерии. В прибыльном периоде налог здесь завышен.
+                      Суммы с НДС, как в отчете Ozon: площадка и платит выручку, и удерживает услуги брутто.
+                      Налог на прибыль посчитан за период, без убытков прошлых периодов и расходов вне Ozon —
+                      зарплаты, аренды, бухгалтерии, поэтому в прибыльном месяце он здесь завышен.
                     </span>
                   </p>
+                </div>
 
+                <div className="space-y-4">
                   <TaxPanel
                     vat={vat}
                     vatRate={vatRate}
@@ -1242,67 +1203,16 @@ export default function AccrualsPage() {
                   />
                 </div>
 
-                {/* Product Categories Breakdown */}
-                {activeCategories.length > 0 && (
-                  <div className="space-y-6 pt-4">
-                    <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">Продажи по категориям</h3>
-                    <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-5">
-                      {activeCategories.map((cat) => {
-                        const currentGrowth = isForecastMode ? (categoryGrowth[cat.name] ?? 1) : 1;
-                        const displayNet = Math.round(cat.net * currentGrowth);
-                        const displaySold = Math.round(cat.sold * currentGrowth);
-                        const displayReturned = Math.round(cat.returned * currentGrowth);
-                        const displayRevenue = cat.revenue * currentGrowth;
-                        
-                        const adjustedTotalNetItems = isForecastMode 
-                          ? activeCategories.reduce((acc, c) => acc + c.net * (categoryGrowth[c.name] ?? 1), 0) 
-                          : totalNetItems;
-                        const pctOfTotal = adjustedTotalNetItems > 0 ? (displayNet / adjustedTotalNetItems) * 100 : 0;
-
-                        return (
-                          <div key={cat.name} className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200/60 p-6 flex flex-col justify-between space-y-5 hover:-translate-y-1 transition-all duration-300">
-                            <div>
-                              <span className="text-sm font-bold text-slate-500">{cat.name}</span>
-                              <div className="text-2xl sm:text-3xl font-extrabold text-slate-900 mt-2 tracking-tight truncate" title={`${displayNet} шт.`}>
-                                {displayNet} <span className="text-base font-bold text-slate-400">шт.</span>
-                              </div>
-                            </div>
-                            
-                            <div className="space-y-2 text-sm">
-                              <div className="flex justify-between items-center">
-                                <span className="text-slate-500">Продано:</span>
-                                <span className="font-bold text-slate-900">{displaySold}</span>
-                              </div>
-                              <div className="flex justify-between items-center">
-                                <span className="text-slate-500">Возвраты:</span>
-                                <span className="font-bold text-rose-500">{displayReturned}</span>
-                              </div>
-                              <div className="flex justify-between items-center pt-2 border-t border-slate-100">
-                                <span className="text-slate-500" title="С НДС: выручка, баллы за скидки и программы партнеров за вычетом возвратов">Продажи:</span>
-                                <span className="font-bold text-emerald-600" title={formatCurrency(displayRevenue)}>
-                                  {formatCurrency(displayRevenue, true)}
-                                </span>
-                              </div>
-                            </div>
-
-                            <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
-                              <div
-                                className="h-full bg-blue-500 rounded-full"
-                                style={{ width: `${Math.min(100, Math.max(0, pctOfTotal))}%` }}
-                              />
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
+                {/* Прибыль по видам товара */}
+                {categoryEconomics.length > 0 && (
+                  <CategoryTable rows={categoryEconomics} totalProfit={actualRealNetResult} isForecast={isForecastMode} />
                 )}
 
                 {/* Main breakdown section */}
                 <div className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200/60 overflow-hidden mt-8">
-                  <div className="p-6 sm:p-8 border-b border-slate-100 flex flex-col xl:flex-row xl:items-center justify-between gap-6">
+                  <div className="px-5 py-4 border-b border-slate-100 flex flex-col xl:flex-row xl:items-center justify-between gap-4">
                     <div className="space-y-2">
-                      <h3 className="text-2xl font-extrabold text-slate-900 tracking-tight">
+                      <h3 className="text-lg font-bold text-slate-900">
                         Детализация операций
                       </h3>
                       <p className="text-sm text-slate-500 max-w-xl">
@@ -1385,9 +1295,9 @@ export default function AccrualsPage() {
                     <table className="w-full text-left border-collapse min-w-[800px]">
                       <thead>
                         <tr className="bg-slate-50/50 text-slate-500 font-bold text-sm border-b border-slate-100">
-                          <th className="px-8 py-5 w-2/5">Операция</th>
-                          <th className="px-8 py-5 text-right w-1/5">Сумма</th>
-                          <th className="px-8 py-5 w-2/5">Структура потока</th>
+                          <th className="px-5 py-2.5 w-2/5">Операция</th>
+                          <th className="px-5 py-2.5 text-right w-1/5">Сумма</th>
+                          <th className="px-5 py-2.5 w-2/5">Структура потока</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-100">
@@ -1403,7 +1313,7 @@ export default function AccrualsPage() {
                             ))
                           ) : (
                             <tr>
-                              <td colSpan={3} className="px-8 py-16 text-center text-slate-400 text-base font-medium">
+                              <td colSpan={3} className="px-5 py-12 text-center text-slate-400 text-base font-medium">
                                 Нет данных для отображения
                               </td>
                             </tr>
@@ -1420,7 +1330,7 @@ export default function AccrualsPage() {
                           ))
                         ) : (
                           <tr>
-                            <td colSpan={3} className="px-8 py-16 text-center text-slate-400 text-base font-medium">
+                            <td colSpan={3} className="px-5 py-12 text-center text-slate-400 text-base font-medium">
                               Нет данных для отображения
                             </td>
                           </tr>
@@ -1440,90 +1350,139 @@ export default function AccrualsPage() {
   );
 }
 
-function SummaryCard({
-  title,
-  value,
-  icon,
-  highlight = false,
-  isPercent = false,
-  subText,
-  originalValue,
-  isForecastActive = false,
-  inverseDifference = false
-}: {
-  title: string;
+interface ResultStep {
+  label: string;
+  sign?: "−" | "=";
   value: number;
-  icon: React.ReactNode;
-  highlight?: boolean;
-  isPercent?: boolean;
-  subText?: string;
-  originalValue?: number;
-  isForecastActive?: boolean;
-  inverseDifference?: boolean;
+  /** Значение по факту — в моделировании показываем разницу с ним */
+  actual: number;
+  /** Расходная статья: ее рост — это хуже */
+  cost?: boolean;
+  hint?: string;
+}
+
+/** Итог периода одной строкой: продажи → списания Ozon → к выплате → себестоимость → налоги → прибыль */
+function ResultStrip({
+  steps,
+  base,
+  profit,
+  actualProfit,
+  margin,
+  actualMargin,
+  isForecast
+}: {
+  steps: ResultStep[];
+  base: number;
+  profit: number;
+  actualProfit: number;
+  margin: number;
+  actualMargin: number;
+  isForecast: boolean;
 }) {
-  let diffElement = null;
-  if (isForecastActive && originalValue !== undefined && Math.abs(originalValue - value) > 0.01) {
-    const diff = value - originalValue;
-    
-    const isWorse = inverseDifference ? diff > 0 : diff < 0;
-    const isBetter = inverseDifference ? diff < 0 : diff > 0;
-    
-    const diffColor = isWorse 
-      ? "text-rose-600 bg-rose-50" 
-      : isBetter 
-        ? "text-emerald-600 bg-emerald-50" 
-        : "text-slate-600 bg-slate-100";
-
-    const formattedDiff = isPercent 
-      ? `${diff > 0 ? "+" : ""}${diff.toFixed(2)}%`
-      : `${diff > 0 ? "+" : ""}${formatCurrency(diff, true)}`;
-
-    diffElement = (
-      <span className={cn("text-xs font-bold px-2 py-1 rounded-lg truncate max-w-[120px]", diffColor)} title={isPercent ? formattedDiff : `${diff > 0 ? "+" : ""}${formatCurrency(diff)}`}>
-        {formattedDiff}
-      </span>
+  const diff = (value: number, actual: number, cost = false) => {
+    const delta = value - actual;
+    if (!isForecast || Math.abs(delta) < 0.5) return null;
+    const better = cost ? delta < 0 : delta > 0;
+    return (
+      <div className={cn("text-[11px] font-semibold tabular-nums", better ? "text-emerald-600" : "text-rose-600")}>
+        {delta > 0 ? "+" : "−"}{NUM0.format(Math.abs(delta))} ₽ к факту
+      </div>
     );
-  }
+  };
+  const isProfit = profit >= 0;
 
   return (
-    <div
-      className={cn(
-        "relative p-6 sm:p-8 rounded-3xl border bg-white flex flex-col justify-between min-h-[200px] transition-all duration-300 hover:-translate-y-1 hover:shadow-lg",
-        highlight ? "border-blue-200/80 shadow-[0_8px_30px_rgb(59,130,246,0.1)] ring-1 ring-blue-500/10" : "border-slate-200/60 shadow-[0_8px_30px_rgb(0,0,0,0.04)]"
-      )}
-    >
-      <div className="flex items-start justify-between">
-        <h4 className="text-sm font-bold text-slate-500 uppercase tracking-wider">{title}</h4>
-        <div className="p-3 bg-slate-50 rounded-2xl shrink-0">
-          {icon}
+    <div className="@container bg-white rounded-3xl border border-slate-200/60 shadow-[0_8px_30px_rgb(0,0,0,0.04)] p-2">
+      <div className="grid grid-cols-2 @lg:grid-cols-4 @4xl:grid-cols-7 gap-1">
+        {steps.map((step) => (
+          <div key={step.label} className="rounded-2xl px-3 py-3 min-w-0" title={step.hint}>
+            <div className="text-xs font-semibold text-slate-500">
+              {step.sign && <span className="text-slate-300 mr-1">{step.sign}</span>}
+              {step.label}
+            </div>
+            <div className="mt-1 text-lg font-bold text-slate-900 tabular-nums whitespace-nowrap">{RUB0.format(step.value)}</div>
+            <div className="text-[11px] text-slate-400 tabular-nums">
+              {step.value === base ? "с НДС, до возвратов" : base ? `${formatPct((step.value / base) * 100)} от продаж` : ""}
+            </div>
+            {diff(step.value, step.actual, step.cost)}
+          </div>
+        ))}
+        <div
+          className={cn("rounded-2xl px-3 py-3 min-w-0", isProfit ? "bg-emerald-50" : "bg-rose-50")}
+          title="Продажи минус списания Ozon, себестоимость и налоги"
+        >
+          <div className="text-xs font-semibold text-slate-600">
+            <span className="text-slate-400 mr-1">=</span>
+            Чистая прибыль
+          </div>
+          <div className={cn("mt-1 text-xl font-extrabold tabular-nums whitespace-nowrap", isProfit ? "text-emerald-700" : "text-rose-700")}>
+            {RUB0.format(profit)}
+          </div>
+          <div className={cn("text-xs font-bold", isProfit ? "text-emerald-700/80" : "text-rose-700/80")}>маржа {formatPct(margin, 2)}</div>
+          {diff(profit, actualProfit)}
+          {isForecast && Math.abs(margin - actualMargin) >= 0.005 && (
+            <div className="text-[11px] text-slate-500">факт: {formatPct(actualMargin, 2)}</div>
+          )}
         </div>
       </div>
+    </div>
+  );
+}
 
-      <div className="mt-6 flex flex-col gap-3 min-w-0">
-        <div 
-          className="text-2xl sm:text-3xl font-extrabold text-slate-900 tracking-tight truncate"
-          title={isPercent ? `${value.toFixed(2)}%` : formatCurrency(value)}
-        >
-          {isPercent ? `${value.toFixed(2)}%` : formatCurrency(value, true)}
-        </div>
-        
-        <div className="flex flex-col gap-1.5 min-h-[28px] justify-center">
-          {diffElement && (
-            <div className="flex items-center flex-wrap gap-2">
-              {diffElement}
-              {isForecastActive && (
-                <span className="text-xs font-semibold text-slate-400 line-through truncate" title={isPercent ? `${originalValue?.toFixed(2)}%` : formatCurrency(originalValue || 0)}>
-                  {isPercent ? `${originalValue?.toFixed(2)}%` : formatCurrency(originalValue || 0, true)}
-                </span>
-              )}
-            </div>
-          )}
-          {subText && (
-            <span className="text-sm font-semibold text-slate-400 truncate" title={subText}>
-              {subText}
-            </span>
-          )}
-        </div>
+/** Прибыль и маржа по видам товара — по факту периода */
+function CategoryTable({ rows, totalProfit, isForecast }: { rows: CategoryEconomics[]; totalProfit: number; isForecast: boolean }) {
+  const sorted = [...rows].sort((a, b) => b.sales - a.sales);
+
+  return (
+    <div className="bg-white rounded-3xl border border-slate-200/60 shadow-[0_8px_30px_rgb(0,0,0,0.04)] overflow-hidden">
+      <div className="px-5 py-4 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <h3 className="text-lg font-bold text-slate-900">Прибыль по категориям</h3>
+        <span className="text-xs text-slate-400">
+          {isForecast ? "по факту периода, без моделирования" : "та же модель, что итог периода; расходы без артикула — по проданным штукам"}
+        </span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm whitespace-nowrap">
+          <thead className="bg-slate-50 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+            <tr>
+              <th className="px-5 py-2.5 text-left">Категория</th>
+              <th className="px-3 py-2.5 text-right">Продано, шт.</th>
+              <th className="px-3 py-2.5 text-right">Возвраты</th>
+              <th className="px-3 py-2.5 text-right">Продажи</th>
+              <th className="px-3 py-2.5 text-right">Прибыль</th>
+              <th className="px-3 py-2.5 text-right">Маржа</th>
+              <th className="px-5 py-2.5 text-left w-1/5">Доля прибыли</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-slate-100">
+            {sorted.map((row) => {
+              const share = totalProfit > 0 && row.profit > 0 ? (row.profit / totalProfit) * 100 : 0;
+              const positive = row.profit >= 0;
+              return (
+                <tr key={row.name} className="hover:bg-slate-50/60">
+                  <td className="px-5 py-2.5 font-semibold text-slate-900">{row.name}</td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-slate-700">{NUM0.format(row.sold)}</td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-slate-500">
+                    {NUM0.format(row.returned)}
+                    <span className="text-slate-400"> · {row.sold > 0 ? formatPct((row.returned / row.sold) * 100) : "—"}</span>
+                  </td>
+                  <td className="px-3 py-2.5 text-right tabular-nums text-slate-700">{RUB0.format(row.sales)}</td>
+                  <td className={cn("px-3 py-2.5 text-right tabular-nums font-semibold", positive ? "text-emerald-600" : "text-rose-600")}>
+                    {RUB0.format(row.profit)}
+                  </td>
+                  <td className={cn("px-3 py-2.5 text-right tabular-nums font-bold", positive ? "text-emerald-700" : "text-rose-700")}>
+                    {row.margin === null ? "—" : formatPct(row.margin * 100)}
+                  </td>
+                  <td className="px-5 py-2.5">
+                    <div className="h-1.5 bg-slate-100 rounded-full overflow-hidden" title={formatPct(share)}>
+                      <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${Math.min(100, share)}%` }} />
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     </div>
   );
@@ -1611,7 +1570,7 @@ function MoneyStructure({
             key={item.label}
             className={cn(item.color, "transition-all duration-500")}
             style={{ width: `${Math.max(0, Math.min(100, item.pct))}%` }}
-            title={`${item.label}: ${item.pct.toFixed(1)}%`}
+            title={`${item.label}: ${formatPct(item.pct)}`}
           />
         ))}
       </div>
@@ -1638,7 +1597,7 @@ function MoneyStructure({
               )}
             </div>
             <span className="text-base sm:text-lg font-extrabold text-slate-900 tabular-nums shrink-0 w-14 sm:w-16 text-right">
-              {item.pct.toFixed(1)}%
+              {formatPct(item.pct)}
             </span>
           </div>
         ))}
@@ -1670,7 +1629,7 @@ function MoneyStructure({
           <span
             className={cn("text-lg sm:text-xl font-extrabold tabular-nums shrink-0 w-14 sm:w-16 text-right", isProfit ? "text-emerald-600" : "text-rose-600")}
           >
-            {netPct.toFixed(1)}%
+            {formatPct(netPct)}
           </span>
         </div>
       </div>
@@ -1730,7 +1689,7 @@ function BreakEvenPrice({
             </div>
             <div className={cn("text-sm font-bold mt-1", needsIncrease ? "text-rose-500" : "text-emerald-600")}>
               {deltaPct > 0 ? "+" : ""}
-              {deltaPct.toFixed(1)}% к текущей цене
+              {formatPct(deltaPct)} к текущей цене
             </div>
           </div>
         </div>
@@ -1742,7 +1701,7 @@ function BreakEvenPrice({
           <div className="text-xs text-slate-500 mb-5 leading-relaxed max-w-2xl">
             Маржа — от продаж с НДС, уже после НДС и налога на прибыль. Шаги растут неравномерно:
             комиссия Ozon — процент от цены, поэтому каждый следующий процент маржи требует все
-            большей прибавки. Потолок при нынешней комиссии и затратах — {maxMargin.toFixed(1)}%.
+            большей прибавки. Потолок при нынешней комиссии и затратах — {formatPct(maxMargin)}.
           </div>
 
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -1758,7 +1717,7 @@ function BreakEvenPrice({
                   {formatCurrency(option.price as number)}
                 </div>
                 <div className="text-xs font-bold text-slate-400 mt-1 tabular-nums">
-                  +{(((option.price as number) - currentPrice) / currentPrice * 100).toFixed(0)}%
+                  +{NUM0.format(((option.price as number) - currentPrice) / currentPrice * 100)}%
                 </div>
               </div>
             ))}
@@ -1984,25 +1943,25 @@ function HierarchicalGroupSection({
     <>
       {/* Parent Group Row */}
       <tr className="bg-slate-50/30 font-bold border-b border-slate-100 hover:bg-slate-50 transition-colors">
-        <td className="px-8 py-5">
-          <div className="text-base font-extrabold text-slate-900 tracking-tight">
+        <td className="px-5 py-2">
+          <div className="text-sm font-bold text-slate-900">
             {groupItem.group}
           </div>
         </td>
-        <td className="px-8 py-5 text-right">
-          <span className={cn("text-base font-extrabold tracking-tight", isGroupInflow ? "text-emerald-600" : "text-rose-600")}>
+        <td className="px-5 py-2 text-right">
+          <span className={cn("text-sm font-bold tabular-nums", isGroupInflow ? "text-emerald-600" : "text-rose-600")}>
             {isGroupInflow ? "+" : ""}
             {formatCurrency(groupItem.amount)}
           </span>
         </td>
-        <td className="px-8 py-5">
-          <div className="flex flex-col gap-2 w-full justify-center">
+        <td className="px-5 py-2">
+          <div className="flex flex-col gap-1 w-full justify-center">
             {isGroupInflow ? (
               <>
                 <div className="flex items-center justify-between text-xs font-bold text-slate-500">
-                  <span>{groupItem.pctOfInflow.toFixed(1)}% от прихода</span>
+                  <span>{formatShare(groupItem.pctOfInflow)} от прихода</span>
                 </div>
-                <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden">
+                <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
                   <div
                      className="h-full bg-emerald-500 rounded-full"
                      style={{ width: `${Math.min(100, groupItem.pctOfInflow)}%` }}
@@ -2012,10 +1971,10 @@ function HierarchicalGroupSection({
             ) : (
               <>
                 <div className="flex items-center justify-between text-xs font-bold text-slate-500">
-                  <span>{groupItem.pctOfOutflow.toFixed(1)}% от списаний</span>
-                  <span className="text-rose-500">{groupItem.pctOfTotalInflowForOutflow.toFixed(1)}% от выручки</span>
+                  <span>{formatShare(groupItem.pctOfOutflow)} от списаний</span>
+                  <span className="text-rose-500">{formatShare(groupItem.pctOfTotalInflowForOutflow)} от прихода</span>
                 </div>
-                <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden">
+                <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
                   <div
                     className="h-full bg-rose-500 rounded-full"
                     style={{ width: `${Math.min(100, groupItem.pctOfOutflow)}%` }}
@@ -2032,25 +1991,25 @@ function HierarchicalGroupSection({
         const isChildInflow = child.amount > 0;
         return (
           <tr key={child.type} className="hover:bg-slate-50/50 transition-colors border-b border-slate-100/50">
-            <td className="px-8 py-4 pl-14 relative">
-              <div className="absolute left-9 top-0 bottom-0 w-px bg-slate-200" />
-              <div className="absolute left-9 top-1/2 w-4 h-px bg-slate-200" />
+            <td className="px-5 py-1.5 pl-10 relative">
+              <div className="absolute left-6 top-0 bottom-0 w-px bg-slate-200" />
+              <div className="absolute left-6 top-1/2 w-3 h-px bg-slate-200" />
               <span className="text-sm font-semibold text-slate-600">
                 {child.type}
               </span>
             </td>
-            <td className="px-8 py-4 text-right">
-              <span className={cn("text-sm font-bold", isChildInflow ? "text-emerald-600" : "text-rose-600")}>
+            <td className="px-5 py-1.5 text-right">
+              <span className={cn("text-sm font-semibold tabular-nums", isChildInflow ? "text-emerald-600" : "text-rose-600")}>
                 {isChildInflow ? "+" : ""}
                 {formatCurrency(child.amount)}
               </span>
             </td>
-            <td className="px-8 py-4">
+            <td className="px-5 py-1.5">
               <div className="flex flex-col gap-1.5 w-full justify-center">
                 {isChildInflow ? (
                   <>
                     <div className="flex items-center justify-between text-[11px] font-semibold text-slate-400">
-                      <span>{child.pctOfInflow.toFixed(1)}% от прихода</span>
+                      <span>{formatShare(child.pctOfInflow)} от прихода</span>
                     </div>
                     <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
                       <div
@@ -2062,8 +2021,8 @@ function HierarchicalGroupSection({
                 ) : (
                   <>
                     <div className="flex items-center justify-between text-[11px] font-semibold text-slate-400">
-                      <span>{child.pctOfOutflow.toFixed(1)}% от списаний</span>
-                      <span className="text-rose-400">{child.pctOfTotalInflowForOutflow.toFixed(1)}% от выручки</span>
+                      <span>{formatShare(child.pctOfOutflow)} от списаний</span>
+                      <span className="text-rose-400">{formatShare(child.pctOfTotalInflowForOutflow)} от прихода</span>
                     </div>
                     <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
                       <div
@@ -2097,28 +2056,28 @@ function BreakdownRow({
   
   return (
     <tr className="hover:bg-slate-50/50 transition-colors group">
-      <td className="px-8 py-5">
-        <div className="space-y-1">
+      <td className="px-5 py-2">
+        <div>
           {groupingMode === "extended" ? (
             <>
-              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">
+              <span className="text-[11px] font-semibold text-slate-400">
                 {item.group}
               </span>
-              <div className="text-base font-bold text-slate-900">
+              <div className="text-sm font-semibold text-slate-900">
                 {item.type}
               </div>
             </>
           ) : (
-            <div className="text-base font-bold text-slate-900 tracking-tight">
+            <div className="text-sm font-semibold text-slate-900">
               {item.group}
             </div>
           )}
         </div>
       </td>
-      <td className="px-8 py-5 text-right">
+      <td className="px-5 py-2 text-right">
         <span
           className={cn(
-            "text-base font-extrabold tracking-tight",
+            "text-sm font-bold tabular-nums",
             isInflow ? "text-emerald-600" : "text-rose-600"
           )}
         >
@@ -2126,14 +2085,14 @@ function BreakdownRow({
           {formatCurrency(item.amount)}
         </span>
       </td>
-      <td className="px-8 py-5">
-        <div className="flex flex-col gap-2 w-full justify-center">
+      <td className="px-5 py-2">
+        <div className="flex flex-col gap-1 w-full justify-center">
           {isInflow ? (
             <>
               <div className="flex items-center justify-between text-xs font-bold text-slate-500">
-                <span>{item.pctOfInflow.toFixed(1)}% от прихода</span>
+                <span>{formatShare(item.pctOfInflow)} от прихода</span>
               </div>
-              <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden">
+              <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
                 <div
                   className="h-full bg-emerald-500 rounded-full transition-all duration-500"
                   style={{ width: `${Math.min(100, item.pctOfInflow)}%` }}
@@ -2143,10 +2102,10 @@ function BreakdownRow({
           ) : (
             <>
               <div className="flex items-center justify-between text-xs font-bold text-slate-500">
-                <span>{item.pctOfOutflow.toFixed(1)}% от списаний</span>
-                <span className="text-rose-500">{item.pctOfTotalInflowForOutflow.toFixed(1)}% от выручки</span>
+                <span>{formatShare(item.pctOfOutflow)} от списаний</span>
+                <span className="text-rose-500">{formatShare(item.pctOfTotalInflowForOutflow)} от прихода</span>
               </div>
-              <div className="w-full h-2.5 bg-slate-100 rounded-full overflow-hidden">
+              <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
                 <div
                   className="h-full bg-rose-500 rounded-full transition-all duration-500"
                   style={{ width: `${Math.min(100, item.pctOfOutflow)}%` }}

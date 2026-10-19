@@ -24,12 +24,13 @@ export interface ParsedTemplate {
   sheetName: string;
   headerRowIndex: number;
   columns: TemplateColumns;
+  headers: string[]; // the header row as is: Ozon renames columns, so the page names them after the file
 }
 
 export interface TemplateColumns {
   article: number;
   strikePrice: number; // "Зачёркнутая цена" — price shown crossed out
-  currentPrice: number; // "Предельная цена без акций" — price the seller sets manually
+  currentPrice: number; // "Предельная цена" (before 19.10.2026 "Предельная цена без акций") — price the seller sets manually
   customerPrice: number;
   priceIndex: number;
   newPrice: number;
@@ -38,19 +39,20 @@ export interface TemplateColumns {
   cogs: number;
   newCogs: number;
   barcode: number;
-  autoDisable: number[]; // "Подключать подходящие акции", "Автоматически добавлять товар в акции"
+  autoDisable: number[]; // "Автоматически добавлять товар в акции", in older templates also "Подключать подходящие акции"
 }
 
-// Ozon periodically renames the template columns. Each role lists the known header
-// variants, newest first; a header matches when it starts with the variant
-// (case-insensitive, ё/е-insensitive), so suffixes like ", руб." don't matter.
+// Ozon periodically renames the template columns. Each role lists the known names, current
+// first. A header matches by its name — the part before units like ", руб." — exactly
+// (case-insensitive, ё/е-insensitive): "Предельная цена" must not catch "Предельная цена
+// для минимального бустинга в акциях, руб."
 const COLUMN_ALIASES = {
   article: ["Артикул"],
   strikePrice: ["Зачёркнутая цена", "Цена до скидки"],
-  currentPrice: ["Предельная цена без акций", "Текущая цена (со скидкой)"],
+  currentPrice: ["Предельная цена", "Предельная цена без акций", "Текущая цена (со скидкой)"],
   customerPrice: ["Цена реализации", "Цена с учетом скидки от Ozon"],
   priceIndex: ["Ценовой индекс товара на рынке на мои товары"],
-  newPrice: ["Новая предельная цена без акций", "Новая цена (со скидкой)"],
+  newPrice: ["Новая предельная цена", "Новая предельная цена без акций", "Новая цена (со скидкой)"],
   newStrikePrice: ["Новая зачёркнутая цена", "Новая цена до скидки"],
   newMinPrice: ["Новое ограничение для акций и стратегий", "Новая минимальная цена"],
   cogs: ["Себестоимость"],
@@ -59,13 +61,21 @@ const COLUMN_ALIASES = {
 } as const;
 
 function normalizeHeader(value: unknown): string {
-  return String(value ?? "").trim().toLowerCase().replace(/ё/g, "е");
+  return String(value ?? "").replace(/\s+/g, " ").trim().toLowerCase().replace(/ё/g, "е");
+}
+
+/** Column name without units: "Новая предельная цена, руб." → "Новая предельная цена" */
+export function columnName(header: unknown): string {
+  return String(header ?? "").split(",")[0].trim();
 }
 
 function findColumn(headers: unknown[], aliases: readonly string[]): number {
-  for (const alias of aliases) {
+  // Oldest name first: a template that still has it is an older one, where a newer name may mean
+  // another column. Until 19.10.2026 "Предельная цена" was the price with promos, next to the
+  // manual "Предельная цена без акций"
+  for (const alias of [...aliases].reverse()) {
     const needle = normalizeHeader(alias);
-    const idx = headers.findIndex((h) => normalizeHeader(h).startsWith(needle));
+    const idx = headers.findIndex((h) => normalizeHeader(columnName(h)) === needle);
     if (idx !== -1) return idx;
   }
   return -1;
@@ -221,6 +231,7 @@ export async function parseOzonTemplate(file: File): Promise<ParsedTemplate> {
           sheetName,
           headerRowIndex,
           columns,
+          headers: Array.from(headers, (h) => String(h ?? "")),
         });
 
       } catch (err) {

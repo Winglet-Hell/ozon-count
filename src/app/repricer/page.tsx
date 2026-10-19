@@ -5,7 +5,7 @@ import { Loader2, FileSpreadsheet, Download, RefreshCw, TrendingUp, Plus, Minus,
 import { motion, AnimatePresence } from "framer-motion";
 import { Header } from "@/components/Header";
 import { CogsInput } from "@/components/CogsInput";
-import { parseOzonTemplate, exportOzonTemplate, type RepricerItem } from "@/lib/repricer";
+import { parseOzonTemplate, exportOzonTemplate, columnName, type RepricerItem } from "@/lib/repricer";
 import { cn } from "@/lib/utils";
 import { useAppState } from "@/components/StoreProvider";
 import { buildSkuEconomics, skuUnitEconomics, pretaxProfitAt, profitAt, breakEvenOf, type UnitEconomics } from "@/lib/unitEconomics";
@@ -464,6 +464,9 @@ export default function RepricerPage() {
 
   const suggestionCount = Object.keys(cogsSuggestions).length;
   const isLoaded = !!parsedData && items.length > 0;
+  // Price columns named as in the loaded template: Ozon renames them every so often
+  const priceColumn = parsedData ? columnName(parsedData.headers[parsedData.columns.currentPrice]) : "";
+  const newPriceColumn = parsedData ? columnName(parsedData.headers[parsedData.columns.newPrice]) : "";
 
   const errorBanner = (
     <AnimatePresence>
@@ -691,7 +694,7 @@ export default function RepricerPage() {
             <div className="shrink-0 flex items-start justify-between gap-4 px-4 sm:px-5 py-3 bg-emerald-50/70 border border-emerald-100 rounded-2xl text-sm text-slate-700">
               <div>
                 <span className="font-bold text-slate-900">Файл «{lastDownload.fileName}» сохранен.</span>{" "}
-                В нем новые цены — {lastDownload.prices} (колонка «Новая предельная цена без акций»)
+                В нем новые цены — {lastDownload.prices} (колонка «{newPriceColumn}»)
                 {" "}и себестоимость — {lastDownload.cogs} (колонка «Новая себестоимость», в конце таблицы; колонка
                 «Себестоимость» показывает то, что в Ozon сейчас).
               </div>
@@ -769,7 +772,7 @@ export default function RepricerPage() {
                 <tr className="[&>th]:bg-slate-50 [&>th]:border-b [&>th]:border-slate-200">
                   <SortTh label="Артикул" sortKey="article" sort={sort} onSort={handleSort} className="sticky left-0 z-30" />
                   <th className="px-2.5 py-2.5 text-center">Индекс</th>
-                  <SortTh label="Текущая" sortKey="price" sort={sort} onSort={handleSort} align="right" title="Предельная цена без акций сейчас" />
+                  <SortTh label="Текущая" sortKey="price" sort={sort} onSort={handleSort} align="right" title={`${priceColumn} сейчас`} />
                   <SortTh label="Новая" sortKey="change" sort={sort} onSort={handleSort} title="Новая цена и изменение к текущей" />
                   <SortTh
                     label="Себест."

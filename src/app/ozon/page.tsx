@@ -139,7 +139,8 @@ export default function OzonCheckPage() {
 
   const [uploadedTemplate, setUploadedTemplate] = useState<ParsedTemplate | null>(null);
   const [uploadedAccruals, setUploadedAccruals] = useState<AccrualsSummary | null>(null);
-  const template = uploadedTemplate ?? repricerParsedData;
+  // Сверять с API имеет смысл только шаблон-файл: загруженное из Ozon и есть API
+  const template = uploadedTemplate ?? (repricerParsedData?.source === "file" ? repricerParsedData : null);
   const accruals = uploadedAccruals ?? accrualsResult;
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState<string | null>(null);

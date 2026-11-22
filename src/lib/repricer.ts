@@ -25,6 +25,10 @@ export interface ParsedTemplate {
   headerRowIndex: number;
   columns: TemplateColumns;
   headers: string[]; // the header row as is: Ozon renames columns, so the page names them after the file
+  /** "file" — a template downloaded from Ozon; "api" — loaded through the API: same items, but no file to write back into */
+  source: "file" | "api";
+  /** When the data was taken from Ozon (API only) */
+  loadedAt?: string;
 }
 
 export interface TemplateColumns {
@@ -232,7 +236,49 @@ export function parseOzonTemplateData(data: Uint8Array): ParsedTemplate {
     headerRowIndex,
     columns,
     headers: Array.from(headers, (h) => String(h ?? "")),
+    source: "file",
   };
+}
+
+/**
+ * «По индексу»: новая цена = текущая / ценовой индекс («на рынке на мои товары»). Товару без индекса —
+ * индекс соседнего размера той же модели с ближайшей ценой, а без такого — текущая цена; оба помечаются.
+ * onlyRaise: индекс применяется только там, где он поднимает цену, остальные остаются с текущей
+ */
+export function priceByIndex(items: RepricerItem[], onlyRaise = false): RepricerItem[] {
+  const clamp = (item: RepricerItem, price: number) => (onlyRaise ? Math.max(item.currentPrice, price) : price);
+  // Model without sizes: the article with digits stripped
+  const baseName = (article: string) => article.replace(/\d+/g, "");
+
+  const indexed = new Map(
+    items
+      .filter((item) => item.priceIndex && item.priceIndex > 0)
+      .map((item) => [item.id, { item, baseName: baseName(item.article), newPrice: clamp(item, Math.round(item.currentPrice / item.priceIndex!)) }])
+  );
+  const indexedList = [...indexed.values()];
+
+  return items.map((item) => {
+    const own = indexed.get(item.id);
+    if (own) return { ...item, newPrice: own.newPrice, needsAttention: false };
+
+    const candidates = indexedList.filter((entry) => entry.baseName === baseName(item.article));
+    if (candidates.length === 0) return { ...item, newPrice: item.currentPrice, needsAttention: true };
+
+    // The sibling with the closest current price
+    let best = candidates[0];
+    let minDiff = Math.abs(best.item.currentPrice - item.currentPrice);
+    for (let i = 1; i < candidates.length; i++) {
+      const diff = Math.abs(candidates[i].item.currentPrice - item.currentPrice);
+      if (diff < minDiff) {
+        best = candidates[i];
+        minDiff = diff;
+      }
+    }
+    // Borrow the sibling's index, not its new price: sizes of one model are priced differently,
+    // and a copied price would drag a cheap size up to an expensive one. Without a price of its own, take the sibling's
+    const newPrice = item.currentPrice > 0 ? Math.round(item.currentPrice / best.item.priceIndex!) : best.newPrice;
+    return { ...item, newPrice: clamp(item, newPrice), needsAttention: true };
+  });
 }
 
 /** What one template row sends to Ozon. null — the cell stays empty, and Ozon keeps what it has */
@@ -303,6 +349,9 @@ export function autoPromoSwitches(parsed: Pick<ParsedTemplate, "columns" | "head
 }
 
 export async function exportOzonTemplate(parsed: ParsedTemplate, updatedItems: RepricerItem[]): Promise<Blob> {
+  if (parsed.source === "api") {
+    throw new Error("Файл можно собрать только из загруженного шаблона: данные взяты из Ozon напрямую — отправьте их кнопкой «Отправить в Ozon»");
+  }
   const { workbook, sheetName } = parsed;
   // Write into a copy of the sheet: the parsed workbook stays as Ozon sent it, so a value from a previous
   // download (a price or COGS changed since) doesn't leak into the next one

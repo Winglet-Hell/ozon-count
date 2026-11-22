@@ -157,44 +157,56 @@ export function ozonVat(value: unknown): string | null {
   return known === undefined ? null : String(known);
 }
 
+function toLivePrice(item: PriceInfoItem & { offer_id: string }): OzonLivePrice {
+  const netPrice = toNumber(item.price?.net_price);
+  return {
+    article: item.offer_id,
+    price: toNumber(item.price?.price),
+    oldPrice: toNumber(item.price?.old_price),
+    minPrice: toNumber(item.price?.min_price),
+    netPrice: netPrice > 0 ? netPrice : null,
+    vat: ozonVat(item.price?.vat),
+    currencyCode: item.price?.currency_code || null,
+    indexes: {
+      ozon: indexValue(item.price_indexes?.ozon_index_data),
+      external: indexValue(item.price_indexes?.external_index_data),
+      self: indexValue(item.price_indexes?.self_marketplaces_index_data)
+    }
+  };
+}
+
+/** Цены страница за страницей: filter — какие товары, по артикулам или все */
+async function collectPrices(credentials: OzonCredentials, filter: Record<string, unknown>, into: Map<string, OzonLivePrice>) {
+  let cursor = "";
+  for (let page = 0; page < 50; page++) {
+    const data = await call<{ items?: PriceInfoItem[]; cursor?: string }>(credentials, "/v5/product/info/prices", {
+      cursor,
+      filter: { ...filter, visibility: "ALL" },
+      limit: OZON_BATCH
+    });
+    const items = data?.items ?? [];
+    for (const item of items) {
+      if (item.offer_id) into.set(item.offer_id, toLivePrice({ ...item, offer_id: item.offer_id }));
+    }
+    cursor = data?.cursor ?? "";
+    if (!cursor || items.length < OZON_BATCH) break;
+  }
+}
+
 /** Текущие цены по артикулам. Артикула, которого нет в Ozon или который в архиве, в ответе не будет */
 export async function fetchLivePrices(credentials: OzonCredentials, articles: string[]): Promise<Map<string, OzonLivePrice>> {
   const prices = new Map<string, OzonLivePrice>();
-
   for (let start = 0; start < articles.length; start += OZON_BATCH) {
-    const chunk = articles.slice(start, start + OZON_BATCH);
-    let cursor = "";
-    // Артикулов в запросе не больше, чем товаров на странице, но курсор все равно проходим — на случай, если Ozon разобьет ответ
-    for (let page = 0; page < 20; page++) {
-      const data = await call<{ items?: PriceInfoItem[]; cursor?: string }>(credentials, "/v5/product/info/prices", {
-        cursor,
-        filter: { offer_id: chunk, visibility: "ALL" },
-        limit: OZON_BATCH
-      });
-      const items = data?.items ?? [];
-      for (const item of items) {
-        if (!item.offer_id) continue;
-        const netPrice = toNumber(item.price?.net_price);
-        prices.set(item.offer_id, {
-          article: item.offer_id,
-          price: toNumber(item.price?.price),
-          oldPrice: toNumber(item.price?.old_price),
-          minPrice: toNumber(item.price?.min_price),
-          netPrice: netPrice > 0 ? netPrice : null,
-          vat: ozonVat(item.price?.vat),
-          currencyCode: item.price?.currency_code || null,
-          indexes: {
-            ozon: indexValue(item.price_indexes?.ozon_index_data),
-            external: indexValue(item.price_indexes?.external_index_data),
-            self: indexValue(item.price_indexes?.self_marketplaces_index_data)
-          }
-        });
-      }
-      cursor = data?.cursor ?? "";
-      if (!cursor || items.length < OZON_BATCH) break;
-    }
+    await collectPrices(credentials, { offer_id: articles.slice(start, start + OZON_BATCH) }, prices);
   }
   return prices;
+}
+
+/** Цены всех товаров, кроме архивных, — то же, что шаблон обновления цен */
+export async function fetchAllPrices(credentials: OzonCredentials): Promise<OzonLivePrice[]> {
+  const prices = new Map<string, OzonLivePrice>();
+  await collectPrices(credentials, {}, prices);
+  return [...prices.values()];
 }
 
 /** Строка запроса на обновление цены. Чего нет — Ozon оставляет как есть */

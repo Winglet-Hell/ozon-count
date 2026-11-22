@@ -1,12 +1,13 @@
 "use client";
 
 import { useState, useCallback, useMemo, useRef } from "react";
-import { Loader2, FileSpreadsheet, Download, RefreshCw, TrendingUp, Plus, Minus, AlertTriangle, Coins, ListChecks, Search, ArrowUp, ArrowDown, X, Send } from "lucide-react";
+import { Loader2, FileSpreadsheet, Download, RefreshCw, TrendingUp, Plus, Minus, AlertTriangle, Coins, ListChecks, Search, ArrowUp, ArrowDown, X, Send, CloudDownload } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Header } from "@/components/Header";
 import { CogsInput } from "@/components/CogsInput";
 import { OzonConnectDialog, OzonConnectionLink, OzonSendDialog, OzonSendReportBanner, useOzonSend } from "@/components/OzonSync";
-import { parseOzonTemplate, exportOzonTemplate, columnName, templateChanges, autoPromoSwitches, type RepricerItem, type OzonChange } from "@/lib/repricer";
+import { parseOzonTemplate, exportOzonTemplate, columnName, templateChanges, autoPromoSwitches, priceByIndex, type ParsedTemplate, type RepricerItem, type OzonChange } from "@/lib/repricer";
+import { loadTemplateFromOzon } from "@/lib/ozonTemplate";
 import { ozonConnectionStore } from "@/lib/persistentStores";
 import { cn } from "@/lib/utils";
 import { useAppState } from "@/components/StoreProvider";
@@ -106,8 +107,8 @@ export default function RepricerPage() {
   const [filter, setFilter] = useState<Filter>("all");
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: "article", dir: 1 });
   const [connectOpen, setConnectOpen] = useState(false);
-  // "Отправить в Ozon" without a key opens the connection first, then carries on with the send
-  const [sendAfterConnect, setSendAfterConnect] = useState(false);
+  // "Отправить в Ozon" or "Загрузить из Ozon" without a key opens the connection first, then carries on
+  const [afterConnect, setAfterConnect] = useState<"send" | "load" | null>(null);
 
   const {
     repricerParsedData: parsedData,
@@ -300,18 +301,18 @@ export default function RepricerPage() {
     setSort(prev => (prev.key === key ? { key, dir: prev.dir === 1 ? -1 : 1 } : { key, dir: 1 }));
   };
 
-  const handleFile = useCallback(async (file: File) => {
+  // A template, from the file or straight from Ozon: the items and the COGS Ozon keeps
+  const loadParsed = useCallback(async (load: () => Promise<ParsedTemplate>, fallbackError: string) => {
     setIsProcessing(true);
     setError(null);
     setParsedData(null);
     setItems([]);
+    ozonSend.dismissReport();
+    setLastDownload(null);
+    setStockSync(null);
 
     try {
-      if (!file.name.endsWith(".xlsx")) {
-        throw new Error("Пожалуйста, загрузите файл отчета в формате Excel (.xlsx)");
-      }
-
-      const parsed = await parseOzonTemplate(file);
+      const parsed = await load();
       setParsedData(parsed);
       const sortedItems = [...parsed.items].sort((a, b) => a.article.localeCompare(b.article, "ru", { numeric: true }));
       setItems(sortedItems);
@@ -321,11 +322,29 @@ export default function RepricerPage() {
       ));
     } catch (err) {
       console.error(err);
-      setError(err instanceof Error ? err.message : "Произошла ошибка при обработке файла");
+      setError(err instanceof Error ? err.message : fallbackError);
     } finally {
       setIsProcessing(false);
     }
-  }, [mergeTemplateCogs]);
+  }, [mergeTemplateCogs, ozonSend, setItems, setParsedData]);
+
+  const handleFile = useCallback((file: File) => loadParsed(async () => {
+    if (!file.name.endsWith(".xlsx")) {
+      throw new Error("Пожалуйста, загрузите файл отчета в формате Excel (.xlsx)");
+    }
+    return parseOzonTemplate(file);
+  }, "Произошла ошибка при обработке файла"), [loadParsed]);
+
+  // The same items without the template: prices, indexes, COGS and barcodes straight from Ozon
+  const handleLoadFromOzon = () => {
+    const credentials = ozonConnectionStore.getSnapshot();
+    if (!credentials) {
+      setAfterConnect("load");
+      setConnectOpen(true);
+      return;
+    }
+    loadParsed(() => loadTemplateFromOzon(credentials), "Не удалось загрузить данные из Ozon");
+  };
 
   // Stock report from the accounting system: COGS by barcode, new and changed values go to Ozon on download
   const handleStockFile = async (file: File) => {
@@ -391,55 +410,7 @@ export default function RepricerPage() {
 
   // onlyRaise: apply the index only where it raises the price; items the index would lower keep their current price
   const handleApplyIndexGlobal = (onlyRaise = false) => {
-    const clamp = (item: RepricerItem, price: number) => (onlyRaise ? Math.max(item.currentPrice, price) : price);
-
-    setItems(prev => {
-      // Step 1: Compute adjusted prices for items that HAVE an index
-      const indexedItems = prev
-        .filter(item => item.priceIndex && item.priceIndex > 0)
-        .map(item => ({
-          ...item,
-          newPrice: clamp(item, Math.round(item.currentPrice / item.priceIndex!)),
-          needsAttention: false,
-          baseName: item.article.replace(/\d+/g, '') // strip digits for similarity matching
-        }));
-
-      // Step 2: Assign prices for all items
-      return prev.map(item => {
-        if (item.priceIndex && item.priceIndex > 0) {
-          // Return the already calculated indexed item (excluding the temporary baseName field)
-          const matched = indexedItems.find(i => i.id === item.id)!;
-          const { baseName, ...rest } = matched as any;
-          return rest;
-        }
-
-        // For items WITHOUT an index, look for a similar item
-        const itemBaseName = item.article.replace(/\d+/g, '');
-        const candidates = indexedItems.filter(i => i.baseName === itemBaseName);
-
-        if (candidates.length > 0) {
-          // Find the candidate whose current price is closest
-          let bestCandidate = candidates[0];
-          let minDiff = Math.abs(bestCandidate.currentPrice - item.currentPrice);
-          for (let i = 1; i < candidates.length; i++) {
-            const diff = Math.abs(candidates[i].currentPrice - item.currentPrice);
-            if (diff < minDiff) {
-              bestCandidate = candidates[i];
-              minDiff = diff;
-            }
-          }
-          // Borrow the sibling's index, not its new price: sizes of one model are priced differently,
-          // and a copied price would drag a cheap size up to an expensive one. Without a price of its own, take the sibling's
-          const newPrice = item.currentPrice > 0
-            ? Math.round(item.currentPrice / bestCandidate.priceIndex!)
-            : bestCandidate.newPrice!;
-          return { ...item, newPrice: clamp(item, newPrice), needsAttention: true };
-        }
-
-        // Fallback: If no similar item is found, just use currentPrice
-        return { ...item, newPrice: item.currentPrice, needsAttention: true };
-      });
-    });
+    setItems(prev => priceByIndex(prev, onlyRaise));
   };
 
   const bulkPctValue = parseFloat(bulkPct.replace(",", "."));
@@ -477,7 +448,7 @@ export default function RepricerPage() {
   const handleSend = () => {
     if (!parsedData) return;
     if (!ozonConnectionStore.getSnapshot()) {
-      setSendAfterConnect(true);
+      setAfterConnect("send");
       setConnectOpen(true);
       return;
     }
@@ -553,7 +524,7 @@ export default function RepricerPage() {
       <Header
         onUploadClick={handleReset}
         showUploadButton={!!parsedData}
-        uploadLabel="Другой шаблон"
+        uploadLabel={parsedData?.source === "api" ? "Другой источник" : "Другой шаблон"}
         activeTab="repricer"
       />
 
@@ -567,6 +538,32 @@ export default function RepricerPage() {
               <p className="text-slate-500 text-lg max-w-lg mx-auto leading-relaxed">
                 Загрузите шаблон обновления цен, чтобы быстро переоценить товары и отправить новые цены в Ozon — через API или файлом.
               </p>
+            </div>
+
+            <div className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200/60 p-6 sm:p-8 flex flex-col sm:flex-row items-center gap-5">
+              <div className="p-4 rounded-2xl bg-blue-50 text-blue-600 shrink-0">
+                {isProcessing ? <Loader2 className="w-8 h-8 animate-spin" /> : <CloudDownload className="w-8 h-8" />}
+              </div>
+              <div className="flex-1 text-center sm:text-left space-y-1">
+                <p className="text-base font-bold text-slate-800">Загрузить из Ozon — без шаблона</p>
+                <p className="text-sm text-slate-500">
+                  Цены, индексы, себестоимость и штрихкоды прямо из Ozon: те же данные, что в шаблоне, на эту минуту.
+                </p>
+              </div>
+              <button
+                onClick={handleLoadFromOzon}
+                disabled={isProcessing}
+                className="shrink-0 flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white text-sm font-semibold rounded-xl shadow-sm transition-all active:scale-95"
+              >
+                <CloudDownload className="w-4 h-4" />
+                Загрузить из Ozon
+              </button>
+            </div>
+
+            <div className="flex items-center gap-3 text-xs font-semibold uppercase tracking-wider text-slate-400">
+              <div className="h-px flex-1 bg-slate-200" />
+              или шаблоном
+              <div className="h-px flex-1 bg-slate-200" />
             </div>
 
             <div className="bg-white rounded-3xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-slate-200/60 p-2 overflow-hidden">
@@ -627,6 +624,20 @@ export default function RepricerPage() {
           <div className="shrink-0 flex flex-wrap items-end gap-x-6 gap-y-3 bg-white px-4 sm:px-5 py-3 rounded-2xl border border-slate-200/60 shadow-[0_8px_30px_rgb(0,0,0,0.04)]">
             <div className="min-w-[10rem]">
               <div className="text-sm font-bold text-slate-900">Товаров: {items.length}</div>
+              <div className="text-xs text-slate-500">
+                {parsedData?.source === "api" && parsedData.loadedAt
+                  ? `Из Ozon на ${new Date(parsedData.loadedAt).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}`
+                  : "Из шаблона"}
+                {" · "}
+                <button
+                  onClick={handleLoadFromOzon}
+                  disabled={isProcessing}
+                  className="text-blue-600 hover:underline disabled:opacity-50"
+                  title="Загрузить заново цены, индексы, себестоимость и штрихкоды из Ozon. Новые цены и правки на странице сбросятся"
+                >
+                  {parsedData?.source === "api" ? "обновить" : "загрузить из Ozon"}
+                </button>
+              </div>
               {overallMetrics ? (
                 <div
                   className="text-sm text-slate-500 mt-0.5"
@@ -740,10 +751,12 @@ export default function RepricerPage() {
               </div>
               <button
                 onClick={handleDownload}
-                disabled={isProcessing}
-                title={`Шаблон с новыми ценами, чтобы загрузить его в Ozon вручную${filterCounts.toOzon > 0
-                  ? `. Вместе с ценами в файл попадет себестоимость ${filterCounts.toOzon} товаров («Новая себестоимость»): Ozon сохранит ее, и следующий шаблон придет уже с ней`
-                  : ""}`}
+                disabled={isProcessing || parsedData?.source === "api"}
+                title={parsedData?.source === "api"
+                  ? "Данные загружены из Ozon напрямую — файла шаблона нет. Отправьте цены кнопкой «Отправить в Ozon» или загрузите шаблон"
+                  : `Шаблон с новыми ценами, чтобы загрузить его в Ozon вручную${filterCounts.toOzon > 0
+                    ? `. Вместе с ценами в файл попадет себестоимость ${filterCounts.toOzon} товаров («Новая себестоимость»): Ozon сохранит ее, и следующий шаблон придет уже с ней`
+                    : ""}`}
                 className="flex items-center gap-2 px-3 py-2 bg-white hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed border border-slate-200 text-slate-700 text-sm font-semibold rounded-xl transition-all active:scale-95"
               >
                 {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
@@ -1009,14 +1022,13 @@ export default function RepricerPage() {
         <OzonConnectDialog
           onClose={() => {
             setConnectOpen(false);
-            setSendAfterConnect(false);
+            setAfterConnect(null);
           }}
           onConnected={() => {
             setConnectOpen(false);
-            if (sendAfterConnect) {
-              setSendAfterConnect(false);
-              handleSend();
-            }
+            setAfterConnect(null);
+            if (afterConnect === "send") handleSend();
+            if (afterConnect === "load") handleLoadFromOzon();
           }}
         />
       )}

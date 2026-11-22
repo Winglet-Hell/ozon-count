@@ -29,13 +29,13 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 function errorMessage(status: number, ozonMessage: string | undefined): string {
   const detail = ozonMessage ? ` Ответ Ozon: «${ozonMessage}».` : "";
   if (status === 401) return `Ozon не принял ключ: проверьте Client ID и API-ключ — возможно, ключ истек или удален.${detail}`;
-  if (status === 403) return `У ключа нет доступа к этому действию: нужна роль Product.${detail}`;
+  if (status === 403) return `Ozon не дал доступ к этому методу: проверьте роли ключа (цены — Product, отчеты — Report).${detail}`;
   if (status === 429) return "Ozon просит подождать: слишком много запросов. Попробуйте через минуту.";
   if (status >= 500) return `Ozon временно не отвечает (ошибка ${status}). Попробуйте позже.${detail}`;
   return `Ozon отклонил запрос (ошибка ${status}).${detail}`;
 }
 
-async function call<T>(credentials: OzonCredentials, path: string, body: unknown): Promise<T> {
+async function call<T>(credentials: OzonCredentials, path: string, body: unknown, retries = RETRIES): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     let response: Response;
     try {
@@ -53,7 +53,7 @@ async function call<T>(credentials: OzonCredentials, path: string, body: unknown
     }
 
     // Повтор безопасен и для обновления цен: он записывает те же значения
-    if ((response.status === 429 || response.status >= 500) && attempt < RETRIES) {
+    if ((response.status === 429 || response.status >= 500) && attempt < retries) {
       await sleep(1500 * (attempt + 1));
       continue;
     }
@@ -73,6 +73,8 @@ export interface OzonKeyInfo {
   /** Когда ключ перестанет работать, ISO; null — Ozon не сообщил */
   expiresAt: string | null;
   roles: string[];
+  /** Все методы ключа, как их перечисляет Ozon */
+  methods: string[];
   /** Методы из REQUIRED_METHODS, которых у ключа нет */
   missing: string[];
 }
@@ -91,6 +93,7 @@ export async function fetchKeyInfo(credentials: OzonCredentials): Promise<OzonKe
   return {
     expiresAt: data?.expires_at || null,
     roles: names,
+    methods: [...methods],
     missing: checkable ? REQUIRED_METHODS.filter((method) => !methods.has(method)) : []
   };
 }
@@ -109,6 +112,12 @@ export interface OzonLivePrice {
   /** Ставка НДС в виде, в котором ее принимает обновление цены («0.22»); null — неизвестна */
   vat: string | null;
   currencyCode: string | null;
+  /** Ценовые индексы, как в шаблоне: на Ozon, на рынке, на рынке на мои товары; null — индекса нет */
+  indexes: { ozon: number | null; external: number | null; self: number | null };
+}
+
+interface PriceIndexData {
+  price_index_value?: number | string;
 }
 
 interface PriceInfoItem {
@@ -121,11 +130,21 @@ interface PriceInfoItem {
     vat?: number | string;
     currency_code?: string;
   };
+  price_indexes?: {
+    ozon_index_data?: PriceIndexData;
+    external_index_data?: PriceIndexData;
+    self_marketplaces_index_data?: PriceIndexData;
+  };
 }
 
 const toNumber = (value: unknown) => {
   const number = Number(value);
   return Number.isFinite(number) ? number : 0;
+};
+
+const indexValue = (data: PriceIndexData | undefined) => {
+  const value = toNumber(data?.price_index_value);
+  return value > 0 ? value : null;
 };
 
 /** Ставки, которые Ozon принимает при обновлении цены */
@@ -163,7 +182,12 @@ export async function fetchLivePrices(credentials: OzonCredentials, articles: st
           minPrice: toNumber(item.price?.min_price),
           netPrice: netPrice > 0 ? netPrice : null,
           vat: ozonVat(item.price?.vat),
-          currencyCode: item.price?.currency_code || null
+          currencyCode: item.price?.currency_code || null,
+          indexes: {
+            ozon: indexValue(item.price_indexes?.ozon_index_data),
+            external: indexValue(item.price_indexes?.external_index_data),
+            self: indexValue(item.price_indexes?.self_marketplaces_index_data)
+          }
         });
       }
       cursor = data?.cursor ?? "";
@@ -231,4 +255,98 @@ export async function importPrices(credentials: OzonCredentials, updates: OzonPr
     }
   }
   return results;
+}
+
+/** Любой метод — для проверки того, что отдает ключ. retries — для длинных выгрузок, где Ozon может попросить подождать */
+export function callOzon<T>(credentials: OzonCredentials, path: string, body: unknown, retries = RETRIES): Promise<T> {
+  return call<T>(credentials, path, body, retries);
+}
+
+/** Штрихкоды по артикулам */
+export async function fetchBarcodes(credentials: OzonCredentials, articles: string[]): Promise<Map<string, string[]>> {
+  const barcodes = new Map<string, string[]>();
+  for (let start = 0; start < articles.length; start += OZON_BATCH) {
+    const data = await call<{ items?: { offer_id?: string; barcodes?: string[] }[] }>(credentials, "/v3/product/info/list", {
+      offer_id: articles.slice(start, start + OZON_BATCH)
+    });
+    for (const item of data?.items ?? []) {
+      if (item.offer_id) barcodes.set(item.offer_id, (item.barcodes ?? []).map(String));
+    }
+  }
+  return barcodes;
+}
+
+/** Цена для покупателя и скидка Ozon. Только с подпиской Premium Pro: без нее Ozon отвечает ошибкой */
+export async function fetchBuyerPrices(credentials: OzonCredentials, skus: string[]): Promise<Map<string, number>> {
+  const prices = new Map<string, number>();
+  for (let start = 0; start < skus.length; start += 100) {
+    const data = await call<{ prices?: { offer_id?: string; customer_price?: { amount?: string | number } }[] }>(
+      credentials,
+      "/v1/product/prices/details",
+      { skus: skus.slice(start, start + 100) }
+    );
+    for (const item of data?.prices ?? []) {
+      const amount = toNumber(item.customer_price?.amount);
+      if (item.offer_id && amount > 0) prices.set(item.offer_id, amount);
+    }
+  }
+  return prices;
+}
+
+/** Справочник начислений: идентификатор типа → название */
+export async function fetchAccrualTypes(credentials: OzonCredentials): Promise<Map<number, string>> {
+  const data = await call<{ accrual_types?: { id?: number | string; name?: string }[] }>(credentials, "/v1/finance/accrual/types", {});
+  return new Map((data?.accrual_types ?? []).map((type) => [Number(type.id), type.name ?? ""]));
+}
+
+/** Начисления за день, страница за страницей. За месяц это сотни запросов, поэтому повторов больше обычного */
+export async function forEachAccrualPage(
+  credentials: OzonCredentials,
+  date: string,
+  onPage: (accruals: unknown[]) => void
+): Promise<number> {
+  let lastId = "";
+  let pages = 0;
+  for (; pages < 500; ) {
+    const data = await call<{ accruals?: unknown[]; last_id?: string }>(
+      credentials,
+      "/v1/finance/accrual/by-day",
+      lastId ? { date, last_id: lastId } : { date },
+      5
+    );
+    pages++;
+    onPage(data?.accruals ?? []);
+    lastId = data?.last_id ?? "";
+    if (!lastId) break;
+  }
+  return pages;
+}
+
+export interface OzonReportInfo {
+  status: string;
+  file: string;
+  error: string;
+  reportType: string;
+}
+
+/** Заказать отчет: Ozon собирает его в фоне и возвращает код, по которому потом выдает файл */
+export async function createReport(credentials: OzonCredentials, path: string, body: unknown): Promise<string> {
+  const data = await call<{ result?: { code?: string } | string; code?: string }>(credentials, path, body);
+  const code = typeof data?.result === "string" ? data.result : data?.result?.code ?? data?.code;
+  if (!code) throw new OzonApiError("Ozon не вернул код отчета", 200);
+  return code;
+}
+
+export async function fetchReportInfo(credentials: OzonCredentials, code: string): Promise<OzonReportInfo> {
+  const data = await call<{ result?: { status?: string; file?: string; error?: string; report_type?: string } }>(
+    credentials,
+    "/v1/report/info",
+    { code }
+  );
+  return {
+    status: data?.result?.status ?? "",
+    file: data?.result?.file ?? "",
+    error: data?.result?.error ?? "",
+    reportType: data?.result?.report_type ?? ""
+  };
 }

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useSyncExternalStore } from "react";
+import Link from "next/link";
 import { AlertTriangle, CheckCircle2, KeyRound, Loader2, RefreshCw, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ozonConnectionStore } from "@/lib/persistentStores";
@@ -254,7 +255,8 @@ export function OzonConnectDialog({ onClose, onConnected }: { onClose: () => voi
         )}
 
         <p className="text-xs text-slate-400">
-          Ключ хранится только в этом браузере и отправляется только в Ozon. На другом компьютере его нужно будет ввести заново.
+          Ключ хранится только в этом браузере и отправляется только в Ozon. На другом компьютере его нужно будет ввести заново.{" "}
+          <Link href="/ozon" className="text-blue-600 hover:underline">Проверка: что отдает Ozon API →</Link>
         </p>
 
         <div className="flex items-center justify-between gap-2 pt-1">

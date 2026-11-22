@@ -582,3 +582,33 @@ export const loadDefaultCogs = async (): Promise<{ cogs: Record<string, number>;
 };
 
 
+
+/**
+ * Колонки и число строк файла в формате отчета о начислениях — для проверки файлов, которые отдает Ozon API.
+ * Тем же чтением, что и отчет: библиотека xlsx раскодирует экранированную кириллицу Ozon неверно
+ */
+export const previewAccrualsFile = async (file: File): Promise<{ headers: string[]; rows: number }> => {
+  const zip = await JSZip.loadAsync(await file.arrayBuffer());
+  const sheetFile = zip.file("xl/worksheets/sheet1.xml");
+  if (!sheetFile) return { headers: [], rows: 0 };
+  const sharedStrings = await readSharedStrings(zip);
+
+  const firstRows: string[][] = [];
+  let rows = 0;
+  await streamSheetRows(sheetFile, (rowXml) => {
+    rows++;
+    if (firstRows.length < HEADER_SEARCH_ROWS) firstRows.push(readRowCells(rowXml, sharedStrings));
+  });
+
+  // Заголовок — самая заполненная из первых строк: над таблицей Ozon пишет период и пояснения
+  const filled = (row: string[]) => row.filter((cell) => cell && cell.trim()).length;
+  let headerIndex = -1;
+  firstRows.forEach((row, i) => {
+    if (filled(row) >= 3 && (headerIndex === -1 || filled(row) > filled(firstRows[headerIndex]))) headerIndex = i;
+  });
+  if (headerIndex === -1) return { headers: [], rows };
+  return {
+    headers: firstRows[headerIndex].filter((cell) => cell && cell.trim()).map((cell) => cell.trim()),
+    rows: rows - headerIndex - 1
+  };
+};

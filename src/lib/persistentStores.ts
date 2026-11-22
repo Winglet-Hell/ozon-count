@@ -67,6 +67,26 @@ export const cogsEditsStore = createPersistentStore<CogsRecord>("ozon-count:cogs
 /** Себестоимость из последних шаблонов Ozon: чтобы после перезагрузки не откатиться к старому файлу */
 export const ozonCogsStore = createPersistentStore<CogsRecord>("ozon-count:ozon-cogs", EMPTY_COGS, isRecord);
 
+export interface OzonConnection {
+  clientId: string;
+  apiKey: string;
+  /** Срок действия ключа по данным Ozon (ISO); null — Ozon не сообщил */
+  expiresAt: string | null;
+}
+
+/**
+ * Ключ Ozon Seller API. Хранится только в этом браузере и уходит только в Ozon: в коде сайта и на сервере
+ * его нет, поэтому на другом устройстве ключ нужно ввести заново
+ */
+export const ozonConnectionStore = createPersistentStore<OzonConnection | null>(
+  "ozon-count:ozon-api",
+  null,
+  (value) =>
+    isRecord(value) &&
+    typeof (value as OzonConnection).clientId === "string" &&
+    typeof (value as OzonConnection).apiKey === "string"
+);
+
 /** Последний отчет о начислениях: свернутый по артикулам, он весит сотни килобайт, а грузится заново секунды */
 export const accrualsReportStore = createPersistentStore<AccrualsSummary | null>(
   "ozon-count:accruals-report",

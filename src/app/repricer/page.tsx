@@ -1,11 +1,13 @@
 "use client";
 
 import { useState, useCallback, useMemo, useRef } from "react";
-import { Loader2, FileSpreadsheet, Download, RefreshCw, TrendingUp, Plus, Minus, AlertTriangle, Coins, ListChecks, Search, ArrowUp, ArrowDown, X } from "lucide-react";
+import { Loader2, FileSpreadsheet, Download, RefreshCw, TrendingUp, Plus, Minus, AlertTriangle, Coins, ListChecks, Search, ArrowUp, ArrowDown, X, Send } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Header } from "@/components/Header";
 import { CogsInput } from "@/components/CogsInput";
-import { parseOzonTemplate, exportOzonTemplate, columnName, type RepricerItem } from "@/lib/repricer";
+import { OzonConnectDialog, OzonConnectionLink, OzonSendDialog, OzonSendReportBanner, useOzonSend } from "@/components/OzonSync";
+import { parseOzonTemplate, exportOzonTemplate, columnName, templateChanges, autoPromoSwitches, type RepricerItem, type OzonChange } from "@/lib/repricer";
+import { ozonConnectionStore } from "@/lib/persistentStores";
 import { cn } from "@/lib/utils";
 import { useAppState } from "@/components/StoreProvider";
 import { buildSkuEconomics, skuUnitEconomics, pretaxProfitAt, profitAt, breakEvenOf, type UnitEconomics } from "@/lib/unitEconomics";
@@ -73,6 +75,9 @@ const sortValue = (row: Row, key: SortKey): number | string | null => {
   }
 };
 
+/** A row as it goes to Ozon: with the promo floor and the COGS computed on the page */
+const toTemplateItem = (row: Row): RepricerItem => ({ ...row.item, minPrice: row.min.value, newCogs: row.toOzon });
+
 const normalizeSearch = (value: string) => value.toLowerCase().replace(/ё/g, "е").trim();
 
 // Group key for alternating row backgrounds: the letters of the article, i.e. kind and color without sizes
@@ -100,6 +105,9 @@ export default function RepricerPage() {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [sort, setSort] = useState<{ key: SortKey; dir: 1 | -1 }>({ key: "article", dir: 1 });
+  const [connectOpen, setConnectOpen] = useState(false);
+  // "Отправить в Ozon" without a key opens the connection first, then carries on with the send
+  const [sendAfterConnect, setSendAfterConnect] = useState(false);
 
   const {
     repricerParsedData: parsedData,
@@ -230,6 +238,35 @@ export default function RepricerPage() {
 
   const rows = useMemo(() => items.map(item => computeRow(item, skuCogs[item.article] || 0)), [items, skuCogs, computeRow]);
 
+  // What goes to Ozon: the file and the API send are built from the same rows
+  const pendingChanges = useMemo(
+    () => (parsedData ? templateChanges(parsedData, rows.map(toTemplateItem)) : []),
+    [parsedData, rows]
+  );
+
+  // Ozon took these: the template's current values now lag behind, so bring them up to what Ozon has
+  const handleAccepted = useCallback((accepted: OzonChange[]) => {
+    const byArticle = new Map(accepted.map(change => [change.article, change]));
+    setItems(prev => prev.map(item => {
+      const change = byArticle.get(item.article);
+      if (!change) return item;
+      const next = { ...item, needsAttention: false };
+      if (change.price !== null) {
+        // The index was measured at the old price: kept as is, "По индексу" would apply it a second time
+        if (change.price !== item.currentPrice) next.priceIndex = null;
+        next.currentPrice = change.price;
+        next.newPrice = null;
+      }
+      if (change.netPrice !== null) next.templateCogs = change.netPrice;
+      return next;
+    }));
+    // COGS Ozon now keeps: the typed values are no longer needed, as after loading a fresh template
+    const cogs = Object.fromEntries(accepted.flatMap(change => (change.netPrice !== null ? [[change.article, change.netPrice]] : [])));
+    if (Object.keys(cogs).length > 0) mergeTemplateCogs(cogs);
+  }, [setItems, mergeTemplateCogs]);
+
+  const ozonSend = useOzonSend({ onAccepted: handleAccepted, onError: setError });
+
   const filterCounts = useMemo(() => {
     const counts: Record<Filter, number> = { all: 0, noCogs: 0, loss: 0, changed: 0, toOzon: 0 };
     rows.forEach(row => FILTERS.forEach(({ key }) => { if (matchesFilter(row, key)) counts[key]++; }));
@@ -310,6 +347,7 @@ export default function RepricerPage() {
     setError(null);
     setStockSync(null);
     setLastDownload(null);
+    ozonSend.dismissReport();
     setQuery("");
     setFilter("all");
   };
@@ -424,22 +462,45 @@ export default function RepricerPage() {
     handlePriceChange(id, adjustedPrice.toString());
   };
 
-  const handleDownload = async () => {
-    if (!parsedData) return;
-    // A COGS still being typed hasn't been committed: Safari and Firefox don't take focus from a field when
-    // a button is clicked, so it never blurs. Commit such drafts and build the file from the store's latest
-    // values — the rows of this render predate the commit
+  // Rows as they go to Ozon right now. A COGS still being typed hasn't been committed: Safari and Firefox don't
+  // take focus from a field when a button is clicked, so it never blurs. Commit such drafts and build the rows
+  // from the store's latest values — the rows of this render predate the commit
+  const rowsToSend = () => {
     const drafts = cogsDrafts.current;
     cogsDrafts.current = {};
     if (Object.keys(drafts).length > 0) setCogsEdits(drafts);
     const cogsNow = getCurrentCogs();
-    const exportRows = items.map(item => computeRow(item, cogsNow[item.article] || 0));
+    return items.map(item => computeRow(item, cogsNow[item.article] || 0));
+  };
+
+  // Send through the API: the same values as the file, checked against Ozon first and confirmed by the user
+  const handleSend = () => {
+    if (!parsedData) return;
+    if (!ozonConnectionStore.getSnapshot()) {
+      setSendAfterConnect(true);
+      setConnectOpen(true);
+      return;
+    }
+    const switches = autoPromoSwitches(parsedData);
+    if (switches.unknown.length > 0) {
+      setError(`В шаблоне есть колонки, которые файл выключает, а API — нет: ${switches.unknown.map(name => `«${name}»`).join(", ")}. Чтобы ничего не упустить, скачайте файл и загрузите его в Ozon.`);
+      return;
+    }
+    const changes = templateChanges(parsedData, rowsToSend().map(toTemplateItem));
+    if (changes.length === 0) {
+      setError("Отправлять нечего: новых цен и себестоимости нет.");
+      return;
+    }
+    setError(null);
+    ozonSend.start(changes, new Map(items.map(item => [item.article, item.currentPrice])), switches);
+  };
+
+  const handleDownload = async () => {
+    if (!parsedData) return;
+    const exportRows = rowsToSend();
     try {
       setIsProcessing(true);
-      const blob = await exportOzonTemplate(
-        parsedData,
-        exportRows.map(row => ({ ...row.item, minPrice: row.min.value, newCogs: row.toOzon }))
-      );
+      const blob = await exportOzonTemplate(parsedData, exportRows.map(toTemplateItem));
       const fileName = `Обновленные_цены_${new Date().toLocaleDateString("ru-RU")}.xlsx`;
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
@@ -504,7 +565,7 @@ export default function RepricerPage() {
                 Управление ценами <span className="text-blue-600">Ozon</span>
               </h2>
               <p className="text-slate-500 text-lg max-w-lg mx-auto leading-relaxed">
-                Загрузите шаблон обновления цен, чтобы быстро переоценить товары и скачать готовый файл для Ozon.
+                Загрузите шаблон обновления цен, чтобы быстро переоценить товары и отправить новые цены в Ozon — через API или файлом.
               </p>
             </div>
 
@@ -671,24 +732,40 @@ export default function RepricerPage() {
 
             <div className="ml-auto flex items-end gap-3">
               <div className="text-xs text-slate-500 text-right leading-snug pb-0.5">
-                <div className="font-semibold text-slate-600">В файл для Ozon</div>
+                <div className="font-semibold text-slate-600">В Ozon</div>
                 <div>
                   цены: {filterCounts.changed} · себестоимость: {filterCounts.toOzon}
                 </div>
+                <OzonConnectionLink onClick={() => setConnectOpen(true)} />
               </div>
               <button
                 onClick={handleDownload}
                 disabled={isProcessing}
-                title={filterCounts.toOzon > 0
-                  ? `Вместе с ценами в файл попадет себестоимость ${filterCounts.toOzon} товаров («Новая себестоимость»): Ozon сохранит ее, и следующий шаблон придет уже с ней`
-                  : undefined}
-                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-xl shadow-sm hover:shadow-md transition-all active:scale-95"
+                title={`Шаблон с новыми ценами, чтобы загрузить его в Ozon вручную${filterCounts.toOzon > 0
+                  ? `. Вместе с ценами в файл попадет себестоимость ${filterCounts.toOzon} товаров («Новая себестоимость»): Ozon сохранит ее, и следующий шаблон придет уже с ней`
+                  : ""}`}
+                className="flex items-center gap-2 px-3 py-2 bg-white hover:bg-slate-50 disabled:opacity-50 disabled:cursor-not-allowed border border-slate-200 text-slate-700 text-sm font-semibold rounded-xl transition-all active:scale-95"
               >
                 {isProcessing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
-                Скачать для Ozon
+                Скачать файл
+              </button>
+              <button
+                onClick={handleSend}
+                disabled={isProcessing || ozonSend.step !== null || pendingChanges.length === 0}
+                title={pendingChanges.length === 0
+                  ? "Отправлять нечего: новых цен и себестоимости нет"
+                  : "Отправить через Ozon API те же значения, что попали бы в файл. Перед отправкой приложение сверит цены с Ozon и покажет итог"}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-xl shadow-sm hover:shadow-md transition-all active:scale-95"
+              >
+                <Send className="w-4 h-4" />
+                Отправить в Ozon
               </button>
             </div>
           </div>
+
+          {ozonSend.report && (
+            <OzonSendReportBanner report={ozonSend.report} onRecheck={ozonSend.recheck} onDismiss={ozonSend.dismissReport} />
+          )}
 
           {lastDownload && (
             <div className="shrink-0 flex items-start justify-between gap-4 px-4 sm:px-5 py-3 bg-emerald-50/70 border border-emerald-100 rounded-2xl text-sm text-slate-700">
@@ -926,6 +1003,25 @@ export default function RepricerPage() {
             </table>
           </div>
         </div>
+      )}
+
+      {connectOpen && (
+        <OzonConnectDialog
+          onClose={() => {
+            setConnectOpen(false);
+            setSendAfterConnect(false);
+          }}
+          onConnected={() => {
+            setConnectOpen(false);
+            if (sendAfterConnect) {
+              setSendAfterConnect(false);
+              handleSend();
+            }
+          }}
+        />
+      )}
+      {ozonSend.step && (
+        <OzonSendDialog step={ozonSend.step} onConfirm={ozonSend.confirm} onCancel={ozonSend.cancel} />
       )}
     </main>
   );

@@ -118,129 +118,188 @@ export function resolveTemplateColumns(headers: unknown[]): TemplateColumns {
 }
 
 export async function parseOzonTemplate(file: File): Promise<ParsedTemplate> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      try {
-        const data = new Uint8Array(e.target?.result as ArrayBuffer);
-        const workbook = XLSX.read(data, { type: "array" });
-        
-        let sheetName: string = workbook.SheetNames.find(s => s === "Товары и цены") || 
-                                workbook.SheetNames.find(s => s !== "Инструкция" && s !== "Как работать с шаблоном") || 
-                                workbook.SheetNames[0];
+  return parseOzonTemplateData(new Uint8Array(await file.arrayBuffer()));
+}
 
-        const sheet = workbook.Sheets[sheetName];
-        if (!sheet) {
-          throw new Error("Не найден лист 'Товары и цены' или аналогичный.");
-        }
+/** The template from its bytes: the page reads them from the chosen file, the checks from a file on disk */
+export function parseOzonTemplateData(data: Uint8Array): ParsedTemplate {
+  const workbook = XLSX.read(data, { type: "array" });
 
-        const json = XLSX.utils.sheet_to_json<any[]>(sheet, { header: 1 });
-        
-        let headerRowIndex = -1;
-        for (let i = 0; i < Math.min(10, json.length); i++) {
-          const row = json[i];
-          if (row && row.includes("Артикул")) {
-            headerRowIndex = i;
-            break;
-          }
-        }
+  const sheetName: string = workbook.SheetNames.find(s => s === "Товары и цены") ||
+                            workbook.SheetNames.find(s => s !== "Инструкция" && s !== "Как работать с шаблоном") ||
+                            workbook.SheetNames[0];
 
-        if (headerRowIndex === -1) {
-          throw new Error("Не удалось найти заголовки таблицы. Убедитесь, что это правильный шаблон обновления цен.");
-        }
+  const sheet = workbook.Sheets[sheetName];
+  if (!sheet) {
+    throw new Error("Не найден лист 'Товары и цены' или аналогичный.");
+  }
 
-        const headers = json[headerRowIndex];
-        const columns = resolveTemplateColumns(headers);
-        const {
-          article: articleCol,
-          strikePrice: oldPriceCol,
-          currentPrice: currentPriceCol,
-          newPrice: newPriceCol,
-          priceIndex: priceIndexCol,
-          customerPrice: customerPriceCol,
-          cogs: cogsCol,
-          newCogs: newCogsCol,
-          barcode: barcodeCol,
-        } = columns;
+  const json = XLSX.utils.sheet_to_json<unknown[]>(sheet, { header: 1 });
 
-        const items: RepricerItem[] = [];
+  let headerRowIndex = -1;
+  for (let i = 0; i < Math.min(10, json.length); i++) {
+    const row = json[i];
+    if (row && row.includes("Артикул")) {
+      headerRowIndex = i;
+      break;
+    }
+  }
 
-        // Data starts typically after headers + 1 (the 'Нередактируемое/Редактируемое' row) or immediately after headers
-        const dataStartIndex = headerRowIndex + 2; 
+  if (headerRowIndex === -1) {
+    throw new Error("Не удалось найти заголовки таблицы. Убедитесь, что это правильный шаблон обновления цен.");
+  }
 
-        for (let i = dataStartIndex; i < json.length; i++) {
-          const row = json[i];
-          if (!row || row.length === 0) continue;
-          
-          const article = row[articleCol];
-          if (!article) continue; // Skip empty rows
+  const headers = json[headerRowIndex];
+  const columns = resolveTemplateColumns(headers);
+  const {
+    article: articleCol,
+    strikePrice: oldPriceCol,
+    currentPrice: currentPriceCol,
+    newPrice: newPriceCol,
+    priceIndex: priceIndexCol,
+    customerPrice: customerPriceCol,
+    cogs: cogsCol,
+    newCogs: newCogsCol,
+    barcode: barcodeCol,
+  } = columns;
 
-          const currentPrice = parseFloat(String(row[currentPriceCol]).replace(",", ".")) || 0;
-          const oldPrice = oldPriceCol !== -1 ? parseFloat(String(row[oldPriceCol]).replace(",", ".")) || 0 : 0;
-          
-          let newPrice: number | null = parseFloat(String(row[newPriceCol]).replace(",", "."));
-          if (isNaN(newPrice)) {
-            newPrice = null;
-          }
-          
-          let priceIndex: number | null = priceIndexCol !== -1 ? parseFloat(String(row[priceIndexCol]).replace(",", ".")) : null;
-          if (isNaN(priceIndex as number) || priceIndex === 0) {
-            priceIndex = null;
-          }
+  const items: RepricerItem[] = [];
 
-          let customerPrice: number | null = customerPriceCol !== -1 ? parseFloat(String(row[customerPriceCol]).replace(",", ".")) : null;
-          if (isNaN(customerPrice as number)) {
-            customerPrice = null;
-          }
+  // Data starts typically after headers + 1 (the 'Нередактируемое/Редактируемое' row) or immediately after headers
+  const dataStartIndex = headerRowIndex + 2;
 
-          let ozonDiscountPct = 0;
-          if (customerPrice && currentPrice > 0 && customerPrice < currentPrice) {
-            ozonDiscountPct = 1 - (customerPrice / currentPrice);
-          }
+  for (let i = dataStartIndex; i < json.length; i++) {
+    const row = json[i];
+    if (!row || row.length === 0) continue;
 
-          let multiplier = 1.5; // default 33% discount
-          if (currentPrice > 0 && oldPrice > currentPrice) {
-            multiplier = oldPrice / currentPrice;
-          }
+    const article = row[articleCol];
+    if (!article) continue; // Skip empty rows
 
-          // COGS kept in Ozon; "Новая себестоимость" wins if it was filled in before uploading
-          const readCogs = (col: number) => {
-            const value = col !== -1 ? parseFloat(String(row[col]).replace(",", ".")) : NaN;
-            return value > 0 ? value : null;
-          };
-          const templateCogs = readCogs(newCogsCol) ?? readCogs(cogsCol);
+    const currentPrice = parseFloat(String(row[currentPriceCol]).replace(",", ".")) || 0;
+    const oldPrice = oldPriceCol !== -1 ? parseFloat(String(row[oldPriceCol]).replace(",", ".")) || 0 : 0;
 
-          items.push({
-            id: String(article), // Use article as ID
-            article: String(article),
-            currentPrice,
-            newPrice,
-            multiplier,
-            priceIndex,
-            customerPrice,
-            ozonDiscountPct,
-            rowIndex: i,
-            templateCogs,
-            barcodes: barcodeCol !== -1 ? splitBarcodes(row[barcodeCol]) : [],
-          });
-        }
+    let newPrice: number | null = parseFloat(String(row[newPriceCol]).replace(",", "."));
+    if (isNaN(newPrice)) {
+      newPrice = null;
+    }
 
-        resolve({
-          items,
-          workbook,
-          sheetName,
-          headerRowIndex,
-          columns,
-          headers: Array.from(headers, (h) => String(h ?? "")),
-        });
+    let priceIndex: number | null = priceIndexCol !== -1 ? parseFloat(String(row[priceIndexCol]).replace(",", ".")) : null;
+    if (isNaN(priceIndex as number) || priceIndex === 0) {
+      priceIndex = null;
+    }
 
-      } catch (err) {
-        reject(err);
-      }
+    let customerPrice: number | null = customerPriceCol !== -1 ? parseFloat(String(row[customerPriceCol]).replace(",", ".")) : null;
+    if (isNaN(customerPrice as number)) {
+      customerPrice = null;
+    }
+
+    let ozonDiscountPct = 0;
+    if (customerPrice && currentPrice > 0 && customerPrice < currentPrice) {
+      ozonDiscountPct = 1 - (customerPrice / currentPrice);
+    }
+
+    let multiplier = 1.5; // default 33% discount
+    if (currentPrice > 0 && oldPrice > currentPrice) {
+      multiplier = oldPrice / currentPrice;
+    }
+
+    // COGS kept in Ozon; "Новая себестоимость" wins if it was filled in before uploading
+    const readCogs = (col: number) => {
+      const value = col !== -1 ? parseFloat(String(row[col]).replace(",", ".")) : NaN;
+      return value > 0 ? value : null;
     };
-    reader.onerror = (err) => reject(err);
-    reader.readAsArrayBuffer(file);
-  });
+    const templateCogs = readCogs(newCogsCol) ?? readCogs(cogsCol);
+
+    items.push({
+      id: String(article), // Use article as ID
+      article: String(article),
+      currentPrice,
+      newPrice,
+      multiplier,
+      priceIndex,
+      customerPrice,
+      ozonDiscountPct,
+      rowIndex: i,
+      templateCogs,
+      barcodes: barcodeCol !== -1 ? splitBarcodes(row[barcodeCol]) : [],
+    });
+  }
+
+  return {
+    items,
+    workbook,
+    sheetName,
+    headerRowIndex,
+    columns,
+    headers: Array.from(headers, (h) => String(h ?? "")),
+  };
+}
+
+/** What one template row sends to Ozon. null — the cell stays empty, and Ozon keeps what it has */
+export interface OzonChange {
+  article: string;
+  rowIndex: number;
+  /** «Новая предельная цена». Without it the strike price, the promo floor and the promo switches stay as they are too */
+  price: number | null;
+  /** «Новая зачёркнутая цена» */
+  oldPrice: number | null;
+  /** «Новое ограничение для акций и стратегий» */
+  minPrice: number | null;
+  /** «Новая себестоимость» */
+  netPrice: number | null;
+}
+
+/**
+ * Everything the app sends to Ozon, row by row. The downloaded file and the API request are both built
+ * from it, so they can't drift apart
+ */
+export function templateChanges(parsed: ParsedTemplate, updatedItems: RepricerItem[]): OzonChange[] {
+  const { newStrikePrice, newMinPrice, newCogs } = parsed.columns;
+  const changes: OzonChange[] = [];
+
+  for (const item of updatedItems) {
+    // COGS goes back to Ozon independently of the price: Ozon keeps it, and the next template brings it along
+    const netPrice = newCogs !== -1 && item.newCogs != null ? item.newCogs : null;
+    const price = item.newPrice ?? null;
+    if (price === null && netPrice === null) continue;
+
+    changes.push({
+      article: item.article,
+      rowIndex: item.rowIndex,
+      price,
+      // The strike price follows the new price, so it always stays above it
+      oldPrice: price !== null && newStrikePrice !== -1 ? Math.ceil(price * item.multiplier) : null,
+      // Promo floor: the page passes a break-even based value (the price itself when it's unknown).
+      // No blind fallback here: a 50% floor at Ozon's ~50% commission is a sure loss
+      minPrice: price !== null && newMinPrice !== -1 && item.minPrice != null ? item.minPrice : null,
+      netPrice,
+    });
+  }
+  return changes;
+}
+
+/**
+ * Promo switches a new price turns off, by the template columns that set them to «НЕТ». Only the ones the
+ * template has: sending through the API must do exactly what the file does
+ */
+export interface AutoPromoSwitches {
+  /** «Подключать подходящие акции» (in templates before 19.10.2026) → auto_action_enabled */
+  autoActions: boolean;
+  /** «Автоматически добавлять товар в акции» → auto_add_to_ozon_actions_list_enabled */
+  autoAdd: boolean;
+  /** Columns the file sets to «НЕТ» with no known API field: sending through the API would skip them */
+  unknown: string[];
+}
+
+export function autoPromoSwitches(parsed: Pick<ParsedTemplate, "columns" | "headers">): AutoPromoSwitches {
+  const switches: AutoPromoSwitches = { autoActions: false, autoAdd: false, unknown: [] };
+  for (const col of parsed.columns.autoDisable) {
+    const header = normalizeHeader(parsed.headers[col]);
+    if (header.includes("акци") && header.includes("подключать")) switches.autoActions = true;
+    else if (header.includes("акци") && header.includes("добавлять")) switches.autoAdd = true;
+    else switches.unknown.push(columnName(parsed.headers[col]));
+  }
+  return switches;
 }
 
 export async function exportOzonTemplate(parsed: ParsedTemplate, updatedItems: RepricerItem[]): Promise<Blob> {
@@ -254,36 +313,23 @@ export async function exportOzonTemplate(parsed: ParsedTemplate, updatedItems: R
   };
   const {
     newPrice: newPriceCol,
-    newStrikePrice: newPriceNoDiscountCol,
+    newStrikePrice: newStrikePriceCol,
     newMinPrice: minPriceCol,
     newCogs: newCogsCol,
     autoDisable: autoDisableCols,
   } = parsed.columns;
 
-  updatedItems.forEach((item) => {
-    // COGS goes back to Ozon independently of the price: Ozon keeps it, and the next template brings it along
-    if (newCogsCol !== -1 && item.newCogs != null) {
-      setCell(newCogsCol, item.rowIndex, "n", item.newCogs);
-    }
+  for (const change of templateChanges(parsed, updatedItems)) {
+    const row = change.rowIndex;
+    if (change.netPrice !== null) setCell(newCogsCol, row, "n", change.netPrice);
+    if (change.price === null) continue;
 
-    if (item.newPrice !== null && item.newPrice !== undefined) {
-      setCell(newPriceCol, item.rowIndex, "n", item.newPrice);
-
-      // Automatically calculate "price before discount" to always be greater
-      if (newPriceNoDiscountCol !== -1) {
-        setCell(newPriceNoDiscountCol, item.rowIndex, "n", Math.ceil(item.newPrice * item.multiplier));
-      }
-
-      // Promo floor: the page passes a break-even based value (the price itself when it's unknown).
-      // No blind fallback here: a 50% floor at Ozon's ~50% commission is a sure loss
-      if (minPriceCol !== -1 && item.minPrice != null) {
-        setCell(minPriceCol, item.rowIndex, "n", item.minPrice);
-      }
-
-      // Automatically disable auto-promos and auto-connections
-      autoDisableCols.forEach((colIdx) => setCell(colIdx, item.rowIndex, "s", "НЕТ"));
-    }
-  });
+    setCell(newPriceCol, row, "n", change.price);
+    if (change.oldPrice !== null) setCell(newStrikePriceCol, row, "n", change.oldPrice);
+    if (change.minPrice !== null) setCell(minPriceCol, row, "n", change.minPrice);
+    // Automatically disable auto-promos and auto-connections
+    autoDisableCols.forEach((colIdx) => setCell(colIdx, row, "s", "НЕТ"));
+  }
 
   const wbout = XLSX.write({ ...workbook, Sheets: { ...workbook.Sheets, [sheetName]: sheet } }, { bookType: "xlsx", type: "array" });
   return new Blob([wbout], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
